@@ -738,10 +738,6 @@ int trigger2_modeset_init(struct trigger2_device *trigger2)
 	if (ret)
 		return ret;
 
-	/*
-	 * The device has a built-in mode list, however we ignore
-	 * the mode list because the device accepts custom modes
-	 */
 	dev->mode_config.min_width = 64;
 	dev->mode_config.max_width = 2048;
 	dev->mode_config.min_height = 16;
