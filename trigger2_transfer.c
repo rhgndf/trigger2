@@ -1,32 +1,33 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-#include <linux/array_size.h>
 #include <linux/highmem.h>
-#include <linux/iosys-map.h>
 #include <linux/jiffies.h>
 #include <linux/limits.h>
 #include <linux/overflow.h>
-#include <linux/slab.h>
+#include <linux/scatterlist.h>
 #include <linux/timer.h>
+#include <linux/unaligned.h>
 #include <linux/vmalloc.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_drv.h>
-#include <drm/drm_format_helper.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
-#include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_print.h>
 
 #include "trigger2.h"
+#include "trigger2_registers.h"
+
+#define TRIGGER2_RGB_BLOCK_PIXELS	1024
+#define TRIGGER2_CODEC_SCRATCH_SIZE	(3 * TRIGGER2_RGB_BLOCK_PIXELS)
+#define TRIGGER2_BULK_CHUNK_SIZE	(20 * 1024)
 
 void trigger2_stop_io(struct trigger2_device *trigger2)
 {
 	WRITE_ONCE(trigger2->display_enabled, false);
 	flush_workqueue(trigger2->transfer_wq);
-	cancel_delayed_work_sync(&trigger2->keepalive_work);
 }
 
 static void trigger2_bulk_timeout(struct timer_list *t)
@@ -37,133 +38,91 @@ static void trigger2_bulk_timeout(struct timer_list *t)
 	usb_sg_cancel(&transfer->sgr);
 }
 
+static int trigger2_send_sg(struct trigger2_transfer *transfer, size_t len)
+{
+	struct trigger2_device *trigger2 = transfer->trigger2;
+	struct usb_device *udev = interface_to_usbdev(trigger2->intf);
+	struct scatterlist sg[DIV_ROUND_UP(TRIGGER2_BULK_CHUNK_SIZE +
+					  PAGE_SIZE - 1, PAGE_SIZE)];
+	size_t done, chunk, remaining, part;
+	u8 *ptr;
+	unsigned int nents, i, page_offset;
+	int ret;
+
+	/* Captured EP02 payload requests are at most 20,480 bytes each. */
+	for (done = 0; done < len; done += chunk) {
+		chunk = min_t(size_t, len - done, TRIGGER2_BULK_CHUNK_SIZE);
+		ptr = (u8 *)transfer->buf.data + done;
+		nents = DIV_ROUND_UP(offset_in_page(ptr) + chunk, PAGE_SIZE);
+		sg_init_table(sg, nents);
+		for (i = 0, remaining = chunk; i < nents; i++) {
+			page_offset = offset_in_page(ptr);
+			part = min_t(size_t, remaining, PAGE_SIZE - page_offset);
+			sg_set_page(&sg[i], vmalloc_to_page(ptr), part, page_offset);
+			ptr += part;
+			remaining -= part;
+		}
+		ret = usb_sg_init(&transfer->sgr, udev, trigger2->bulk_pipe, 0,
+				  sg, nents, chunk, GFP_KERNEL);
+		if (ret)
+			return ret;
+
+		mod_timer(&transfer->timer,
+			  jiffies + msecs_to_jiffies(TRIGGER2_BULK_TIMEOUT_MS));
+		usb_sg_wait(&transfer->sgr);
+		timer_delete_sync(&transfer->timer);
+		if (transfer->sgr.status)
+			return transfer->sgr.status;
+		if (transfer->sgr.bytes != chunk)
+			return -EIO;
+	}
+	return 0;
+}
+
 static void trigger2_transfer_work(struct work_struct *work)
 {
 	struct trigger2_transfer *transfer =
 		container_of(work, struct trigger2_transfer, transfer_work);
 	struct trigger2_device *trigger2 = transfer->trigger2;
 	struct usb_device *udev = interface_to_usbdev(trigger2->intf);
-	int idx, ret;
+	int idx, ret, actual;
 
 	if (!drm_dev_enter(&trigger2->drm, &idx))
 		goto complete;
 
-	/* Submit bulk transfer with a five-second timeout. */
-	ret = usb_sg_init(&transfer->sgr, udev, trigger2->bulk_pipe, 0,
-			  transfer->buf.sgt.sgl,
-			  transfer->buf.sgt.nents, transfer->frame_len,
-			  GFP_KERNEL);
-	if (ret) {
-		drm_err_ratelimited(&trigger2->drm,
-				    "failed to initialize USB transfer: %d\n",
-				    ret);
-		goto exit;
-	}
+	/* Both stages use EP02; the descriptor must precede the SG payload. */
+	ret = usb_bulk_msg(udev, trigger2->bulk_pipe, transfer->header,
+			   TRIGGER2_FRAME_HEADER_LEN, &actual,
+			   TRIGGER2_BULK_TIMEOUT_MS);
+	if (!ret && actual != TRIGGER2_FRAME_HEADER_LEN)
+		ret = -EIO;
+	if (!ret)
+		ret = trigger2_send_sg(transfer, transfer->frame_len);
+	if (ret)
+		drm_err_ratelimited(&trigger2->drm, "USB frame failed: %d\n", ret);
 
-	mod_timer(&transfer->timer,
-		  jiffies + msecs_to_jiffies(TRIGGER2_BULK_TIMEOUT_MS));
-	usb_sg_wait(&transfer->sgr);
-	timer_delete_sync(&transfer->timer);
-
-	if (transfer->sgr.status)
-		drm_err_ratelimited(&trigger2->drm,
-				    "USB transfer failed: %d\n",
-				    transfer->sgr.status);
-	else if (transfer->sgr.bytes != transfer->frame_len)
-		drm_err_ratelimited(&trigger2->drm,
-				    "short USB transfer: %zu/%zu bytes\n",
-				    transfer->sgr.bytes, transfer->frame_len);
-	else if (READ_ONCE(trigger2->display_enabled))
-		/* Keepalive must only be sent after a frame has been sent */
-		queue_delayed_work(trigger2->transfer_wq,
-				   &trigger2->keepalive_work,
-				   msecs_to_jiffies(TRIGGER2_KEEPALIVE_INTERVAL_MS));
-
-exit:
 	drm_dev_exit(idx);
 complete:
 	complete(&transfer->frame_complete);
-}
-
-static void trigger2_keepalive_work(struct work_struct *work)
-{
-	struct trigger2_device *trigger2 =
-		container_of(to_delayed_work(work), struct trigger2_device,
-			     keepalive_work);
-	struct usb_device *udev = interface_to_usbdev(trigger2->intf);
-	u8 response;
-	int idx, ret;
-
-	if (!READ_ONCE(trigger2->display_enabled))
-		return;
-
-	if (!drm_dev_enter(&trigger2->drm, &idx))
-		return;
-
-	ret = usb_control_msg_recv(udev, 0, TRIGGER2_REQUEST_KEEPALIVE,
-				   USB_DIR_IN | USB_TYPE_VENDOR |
-					   USB_RECIP_DEVICE,
-				   0x0002, 0x0000, &response,
-				   sizeof(response), USB_CTRL_GET_TIMEOUT,
-				   GFP_KERNEL);
-	if (ret)
-		drm_err_ratelimited(&trigger2->drm,
-				    "keepalive request failed: %d\n", ret);
-
-	if (READ_ONCE(trigger2->display_enabled))
-		mod_delayed_work(trigger2->transfer_wq,
-				 &trigger2->keepalive_work,
-				 msecs_to_jiffies(TRIGGER2_KEEPALIVE_INTERVAL_MS));
-
-	drm_dev_exit(idx);
 }
 
 void trigger2_free_bulk_buffer(struct trigger2_transfer_buf *buf)
 {
 	if (!buf->data)
 		return;
-	sg_free_table(&buf->sgt);
 	vfree(buf->data);
 	buf->data = NULL;
 	buf->len = 0;
 }
 
-
-int trigger2_alloc_bulk_buffer(struct trigger2_transfer_buf *buf,
-				      size_t len)
+int trigger2_alloc_bulk_buffer(struct trigger2_transfer_buf *buf, size_t len)
 {
-	unsigned int num_pages;
-	int ret, i;
-	struct page **pages;
-	u8 *data;
-	void *ptr;
-
-	/* Large transfer buffer requires vmalloc and a scatterlist. */
-	data = vmalloc_32(len);
-	if (!data)
+	/* Codec scratch follows the payload and is never sent over USB. */
+	buf->data = vmalloc_32(size_add(len, TRIGGER2_CODEC_SCRATCH_SIZE));
+	if (!buf->data)
 		return -ENOMEM;
-
-	num_pages = DIV_ROUND_UP(len, PAGE_SIZE);
-	pages = kmalloc_array(num_pages, sizeof(struct page *), GFP_KERNEL);
-	if (!pages) {
-		ret = -ENOMEM;
-		goto err_vfree;
-	}
-	for (i = 0, ptr = data; i < num_pages; i++, ptr += PAGE_SIZE)
-		pages[i] = vmalloc_to_page(ptr);
-	ret = sg_alloc_table_from_pages(&buf->sgt, pages,
-					num_pages, 0, len, GFP_KERNEL);
-	kfree(pages);
-	if (ret)
-		goto err_vfree;
-
-	buf->data = data;
 	buf->len = len;
-
 	return 0;
-err_vfree:
-	vfree(data);
-	return ret;
 }
 
 static void trigger2_init_transfer(struct trigger2_device *trigger2,
@@ -176,18 +135,112 @@ static void trigger2_init_transfer(struct trigger2_device *trigger2,
 	transfer->trigger2 = trigger2;
 }
 
-
-static u8 trigger2_bulk_header_checksum(const struct trigger2_bulk_header *header)
+int trigger2_transfer_mode_init(struct trigger2_device *trigger2,
+				const struct drm_display_mode *mode)
 {
-	const u8 *data = (const u8 *)header;
-	u16 checksum = 0;
-	size_t i;
+	struct trigger2_transfer *transfer = &trigger2->transfers[0];
+	struct usb_device *udev = interface_to_usbdev(trigger2->intf);
+	u32 width = mode->hdisplay, height = mode->vdisplay;
+	u64 pixels = (u64)width * height;
+	u64 bound = (u64)trigger2->frame_base +
+		    9 * (u64)width * ALIGN(height, 16);
+	size_t bitmap_len = pixels / 8;
+	u8 *setup = transfer->header;
+	int actual, ret;
 
-	for (i = 0; i < sizeof(struct trigger2_bulk_header) - 1; i++)
-		checksum += data[i];
-	checksum &= 0xff;
-	checksum = 0x100 - checksum;
-	return checksum & 0xff;
+	/* Quarter dimensions and bitmap bytes must be exact on the wire. */
+	if (!width || !height || ((width | height) & 3) ||
+	    width > U16_MAX || height > U16_MAX - 15 ||
+	    pixels > (U32_MAX - 4) / 32 ||
+	    3 * pixels > 0xffffff || bound > U32_MAX ||
+	    bound != trigger2->frame_end || bitmap_len > transfer->buf.len)
+		return -EINVAL;
+
+	memset(setup, 0, 21);
+	setup[0] = TRIGGER2_CMD_BITMAP;
+	put_unaligned_le32(trigger2->frame_base, setup + 1);
+	put_unaligned_le16(width / 4, setup + 5);
+	put_unaligned_le16(height / 4, setup + 7);
+	put_unaligned_le16(width, setup + 9);
+	put_unaligned_le16(height, setup + 11);
+	setup[14] = setup[16] = 0x10;
+	put_unaligned_le32(32 * pixels + 4, setup + 17);
+
+	ret = usb_bulk_msg(udev, trigger2->bulk_pipe, setup, 21,
+			   &actual, TRIGGER2_BULK_TIMEOUT_MS);
+	if (ret)
+		return ret;
+	if (actual != 21)
+		return -EIO;
+
+	memset(transfer->buf.data, 0, bitmap_len);
+	flush_kernel_vmap_range(transfer->buf.data, bitmap_len);
+	ret = trigger2_send_sg(transfer, bitmap_len);
+	if (ret)
+		drm_err(&trigger2->drm, "USB mode bitmap failed: %d\n", ret);
+	return ret;
+}
+
+static void trigger2_frame_header(u8 *header, u32 addr, u16 width, u16 height,
+				  u32 frame_end, u32 raw_len, u32 encoded_len)
+{
+	memset(header, 0, TRIGGER2_FRAME_HEADER_LEN);
+	header[0] = TRIGGER2_CMD_FRAME;
+	put_unaligned_le32(addr, header + 2);
+	put_unaligned_le32(addr, header + 6);
+	put_unaligned_le16(width, header + 10);
+	put_unaligned_le16(height, header + 12);
+	put_unaligned_le16(width, header + 14);
+	put_unaligned_le16(height, header + 16);
+	header[19] = header[21] = 0x40;
+	put_unaligned_le32(frame_end, header + 23);
+	header[27] = raw_len;
+	header[28] = raw_len >> 8;
+	header[29] = raw_len >> 16;
+	header[30] = encoded_len;
+	header[31] = encoded_len >> 8;
+	header[32] = encoded_len >> 16;
+	header[33] = 0x30;
+	header[34] = 0x05;
+	header[35] = 0x28;
+}
+
+int trigger2_transfer_blank_frame(struct trigger2_device *trigger2,
+				  u16 width, u16 height)
+{
+	struct trigger2_transfer *transfer = &trigger2->transfers[0];
+	struct usb_device *udev = interface_to_usbdev(trigger2->intf);
+	u8 *out = transfer->buf.data;
+	size_t pixels = (size_t)width * height, pos, written = 0;
+	size_t n, rem, run;
+	unsigned int c;
+	int actual, ret;
+
+	if (3 * pixels > transfer->buf.len || 3 * pixels > 0xffffff)
+		return -EINVAL;
+
+	for (pos = 0; pos < pixels; pos += n) {
+		n = min_t(size_t, TRIGGER2_RGB_BLOCK_PIXELS, pixels - pos);
+		for (c = 0; c < 3; c++)
+			for (rem = n; rem; rem -= run) {
+				run = min_t(size_t, rem, 251);
+				out[written++] = 0x30;
+				out[written++] = run - 1;
+				out[written++] = 0;
+			}
+	}
+	trigger2_frame_header(transfer->header, trigger2->frame_base, width,
+			      height, trigger2->frame_end, 3 * pixels, written);
+	flush_kernel_vmap_range(transfer->buf.data, written);
+	ret = usb_bulk_msg(udev, trigger2->bulk_pipe, transfer->header,
+			   TRIGGER2_FRAME_HEADER_LEN, &actual,
+			   TRIGGER2_BULK_TIMEOUT_MS);
+	if (ret)
+		return ret;
+	if (actual != TRIGGER2_FRAME_HEADER_LEN)
+		return -EIO;
+
+	return trigger2_send_sg(transfer, written);
 }
 
 static void trigger2_clear_rect(struct drm_rect *rect)
@@ -206,22 +259,93 @@ static void trigger2_merge_rect(struct drm_rect *r1, const struct drm_rect *r2)
 	r1->y2 = max(r1->y2, r2->y2);
 }
 
+/*
+ * EP02 pixels are planar RGB in successive 1024-pixel raster blocks.  The
+ * observed encoder substitutes 0x31 for pixel component 0x30: literal 0x30
+ * cannot be distinguished from the run marker in captured traffic.
+ */
+static size_t trigger2_encode_frame(struct trigger2_transfer *transfer,
+				    const struct drm_plane_state *state,
+				    const struct drm_rect *src,
+				    const struct drm_rect *dst,
+				    const struct drm_rect *rect,
+				    const struct iosys_map *map)
+{
+	u8 (*channels)[TRIGGER2_RGB_BLOCK_PIXELS] =
+		(void *)((u8 *)transfer->buf.data + transfer->buf.len);
+	u8 *out = transfer->buf.data;
+	size_t total = (size_t)drm_rect_width(rect) * drm_rect_height(rect);
+	size_t pos, written = 0;
+	int x = rect->x1, y = rect->y1;
+	unsigned int i, c, n, run;
+	u32 pixel;
+	u8 value;
+
+	for (pos = 0; pos < total; pos += n) {
+		n = min_t(size_t, TRIGGER2_RGB_BLOCK_PIXELS, total - pos);
+		for (i = 0; i < n; i++) {
+			pixel = 0;
+			if (x >= dst->x1 && x < dst->x2 &&
+			    y >= dst->y1 && y < dst->y2) {
+				int sx = x - dst->x1 + src->x1;
+				int sy = y - dst->y1 + src->y1;
+
+				if (sx >= 0 && sy >= 0 &&
+				    sx < state->fb->width &&
+				    sy < state->fb->height)
+					pixel = iosys_map_rd(map,
+						(size_t)sy * state->fb->pitches[0] +
+						(size_t)sx * sizeof(u32), u32);
+			}
+			channels[0][i] = (pixel >> 16) & 0xff;
+			channels[1][i] = (pixel >> 8) & 0xff;
+			channels[2][i] = pixel & 0xff;
+			for (c = 0; c < 3; c++)
+				if (channels[c][i] == 0x30)
+					channels[c][i] = 0x31;
+			if (++x == rect->x2) {
+				x = rect->x1;
+				y++;
+			}
+		}
+
+		for (c = 0; c < 3; c++) {
+			for (i = 0; i < n; i += run) {
+				value = channels[c][i];
+				run = 1;
+				while (run < 251 && i + run < n &&
+				       channels[c][i + run] == value)
+					run++;
+				if (run >= 3) {
+					out[written++] = 0x30;
+					out[written++] = run - 1;
+					out[written++] = value;
+				} else {
+					out[written++] = value;
+					if (run == 2)
+						out[written++] = value;
+				}
+			}
+		}
+	}
+	return written;
+}
+
 void trigger2_plane_atomic_update(struct drm_plane *plane,
-					 struct drm_atomic_commit *atomic_state)
+				  trigger2_atomic_state *atomic_state)
 {
 	struct drm_plane_state *old_state =
 		drm_atomic_get_old_plane_state(atomic_state, plane);
 	struct drm_plane_state *state =
 		drm_atomic_get_new_plane_state(atomic_state, plane);
-	struct drm_shadow_plane_state *shadow_plane_state =
-		to_drm_shadow_plane_state(state);
 	struct trigger2_device *trigger2 = to_trigger2(plane->dev);
 	struct trigger2_transfer *current_transfer, *previous_transfer;
-	struct trigger2_bulk_header *header;
-	struct drm_rect current_rect, src_rect;
-	struct iosys_map data_map;
-	size_t frame_len, payload_len;
-	int width, height;
+	const struct iosys_map *map;
+	const struct drm_display_mode *mode;
+	struct drm_rect current_rect, damage_rect, src_rect, dst_rect;
+	u64 addr, end;
+	size_t raw_len, frame_len;
+	int width, height, padded_height;
 	int idx, ret;
 
 	if (!drm_atomic_helper_damage_merged(old_state, state, &current_rect))
@@ -233,8 +357,10 @@ void trigger2_plane_atomic_update(struct drm_plane *plane,
 	current_transfer =
 		&trigger2->transfers[trigger2->current_transfer];
 	previous_transfer = &trigger2->transfers[1 - trigger2->current_transfer];
-
 	src_rect = drm_plane_state_src(state);
+	dst_rect = drm_plane_state_dest(state);
+	mode = &drm_atomic_get_new_crtc_state(atomic_state,
+					      state->crtc)->mode;
 
 	/* Match drm_atomic_helper_damage_iter_init() rounding. */
 	src_rect.x1 >>= 16;
@@ -242,86 +368,89 @@ void trigger2_plane_atomic_update(struct drm_plane *plane,
 	src_rect.x2 = (src_rect.x2 >> 16) + !!(src_rect.x2 & 0xffff);
 	src_rect.y2 = (src_rect.y2 >> 16) + !!(src_rect.y2 & 0xffff);
 
-	/* Latency reduction: requeue with the latest frame data. */
+	/* Requeue damage from a queued frame replaced by this newer update. */
 	if (cancel_work(&previous_transfer->transfer_work)) {
 		complete(&previous_transfer->frame_complete);
-
 		trigger2_merge_rect(&current_rect, &previous_transfer->transfer_rect);
-
 		current_transfer = previous_transfer;
 		trigger2->current_transfer = !trigger2->current_transfer;
 	}
 
-	/* Damage deferred by an earlier failed update. */
 	trigger2_merge_rect(&current_rect, &trigger2->pending_rect);
 	trigger2_clear_rect(&trigger2->pending_rect);
-
-	/* Clip merged damage to the new resolution. */
 	if (!drm_rect_intersect(&current_rect, &src_rect))
 		goto exit;
+	damage_rect = current_rect;
+
+	padded_height = ALIGN(mode->vdisplay, 16);
+	/*
+	 * Partial frames use screen coordinates and full-frame stride. Send
+	 * a full frame if the plane is offset or cropped, so its uncovered
+	 * screen pixels (and any old position) are cleared as well.
+	 */
+	if (src_rect.x1 || src_rect.y1 ||
+	    src_rect.x2 != mode->hdisplay ||
+	    src_rect.y2 != mode->vdisplay ||
+	    dst_rect.x1 || dst_rect.y1 ||
+	    dst_rect.x2 != mode->hdisplay ||
+	    dst_rect.y2 != mode->vdisplay) {
+		current_rect = DRM_RECT_INIT(0, 0, mode->hdisplay,
+					     padded_height);
+	} else {
+		current_rect.x1 = round_down(current_rect.x1, 64);
+		current_rect.x2 = min_t(int, round_up(current_rect.x2, 64),
+					mode->hdisplay);
+		current_rect.y1 = round_down(current_rect.y1, 16);
+		current_rect.y2 = min_t(int, round_up(current_rect.y2, 16),
+					padded_height);
+	}
 
 	width = drm_rect_width(&current_rect);
 	height = drm_rect_height(&current_rect);
-	payload_len = array3_size(width, height, 3);
-	frame_len = size_add(payload_len, sizeof(*header));
+	if (!width || !height || width > U16_MAX || height > U16_MAX)
+		goto exit_save_pending;
+	raw_len = array3_size(width, height, 3);
+	addr = (u64)trigger2->frame_base +
+	       3 * ((u64)current_rect.y1 * mode->hdisplay + current_rect.x1);
+	end = addr + 3 * ((u64)(height - 1) * mode->hdisplay + width);
+	if (raw_len > 0xffffff || raw_len > current_transfer->buf.len ||
+	    addr > U32_MAX || end > trigger2->frame_end)
+		goto exit_save_pending;
 
-	/* Buffers are sized for the full mode in crtc atomic_check. */
-	if (drm_WARN_ON_ONCE(plane->dev, frame_len > current_transfer->buf.len))
-		goto exit;
-
-	/*
-	 * This should almost never wait because we have should have a
-	 * pending transfer ready to be de-queued above in case the transfer
-	 * hasn't finished, but do a bounded wait just in case it gets stuck
-	 */
 	if (!wait_for_completion_timeout(&current_transfer->frame_complete,
 					 msecs_to_jiffies(20)))
 		goto exit_save_pending;
 
-	current_transfer->transfer_rect = current_rect;
-
-	current_transfer->frame_len = frame_len;
-	header = current_transfer->buf.data;
-	header->magic = 0xfb;
-	header->length = 0x14;
-	/* flags 0: uncompressed 24-bit RGB888. */
-	header->counter =
-		cpu_to_le16((trigger2->frame_counter++) & 0xfff);
-	header->horizontal_offset = cpu_to_le16(current_rect.x1);
-	header->vertical_offset = cpu_to_le16(current_rect.y1);
-	header->width = cpu_to_le16(width);
-	header->height = cpu_to_le16(height);
-	header->payload_length = cpu_to_le32((u32)payload_len);
-	header->flags = 0x1;
-	header->unknown1 = 0;
-	header->unknown2 = 0;
-	header->checksum = trigger2_bulk_header_checksum(header);
-
-	iosys_map_set_vaddr(&data_map,
-			    current_transfer->buf.data + sizeof(*header));
-
 	ret = drm_gem_fb_begin_cpu_access(state->fb, DMA_FROM_DEVICE);
-	if (ret < 0) {
+	if (ret) {
+		complete(&current_transfer->frame_complete);
+		goto exit_save_pending;
+	}
+	map = &to_drm_shadow_plane_state(state)->data[0];
+	frame_len = trigger2_encode_frame(current_transfer, state, &src_rect,
+					  &dst_rect, &current_rect, map);
+	drm_gem_fb_end_cpu_access(state->fb, DMA_FROM_DEVICE);
+	if (!frame_len || frame_len > 0xffffff ||
+	    frame_len > current_transfer->buf.len) {
 		complete(&current_transfer->frame_complete);
 		goto exit_save_pending;
 	}
 
-	drm_fb_xrgb8888_to_rgb888(&data_map, NULL,
-				  &shadow_plane_state->data[0],
-				  state->fb, &current_rect,
-				  &shadow_plane_state->fmtcnv_state);
-
-	drm_gem_fb_end_cpu_access(state->fb, DMA_FROM_DEVICE);
-
+	trigger2_frame_header(current_transfer->header, addr, width, height,
+			      trigger2->frame_end, raw_len, frame_len);
+	current_transfer->frame_len = frame_len;
+	current_transfer->transfer_rect = damage_rect;
 	flush_kernel_vmap_range(current_transfer->buf.data, frame_len);
 
-	queue_work(trigger2->transfer_wq, &current_transfer->transfer_work);
+	if (!queue_work(trigger2->transfer_wq, &current_transfer->transfer_work)) {
+		complete(&current_transfer->frame_complete);
+		goto exit_save_pending;
+	}
 	trigger2->current_transfer = !trigger2->current_transfer;
 	goto exit;
 
-	/* Retry the dropped damage on the next update. */
 exit_save_pending:
-	trigger2->pending_rect = current_rect;
+	trigger2->pending_rect = damage_rect;
 exit:
 	drm_dev_exit(idx);
 }
@@ -331,5 +460,4 @@ void trigger2_transfer_init(struct trigger2_device *trigger2)
 	trigger2_clear_rect(&trigger2->pending_rect);
 	trigger2_init_transfer(trigger2, &trigger2->transfers[0]);
 	trigger2_init_transfer(trigger2, &trigger2->transfers[1]);
-	INIT_DELAYED_WORK(&trigger2->keepalive_work, trigger2_keepalive_work);
 }

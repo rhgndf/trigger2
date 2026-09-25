@@ -13,3 +13,4 @@ modules.order
 .settings
 .cache.mk
 *.pcapng
+tmp/

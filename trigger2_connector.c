@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+#include <linux/string.h>
+
 #include <drm/drm_atomic_state_helper.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_drv.h>
@@ -9,27 +11,58 @@
 
 #include "trigger2.h"
 
-static int trigger2_read_edid(void *data, u8 *buf, unsigned int block,
-			      size_t len)
+static bool trigger2_edid_checksum_ok(const u8 *block)
 {
-	struct trigger2_device *trigger2 = data;
-	struct usb_device *udev = interface_to_usbdev(trigger2->intf);
+	u8 checksum = 0;
+	unsigned int i;
+
+	for (i = 0; i < EDID_LENGTH; i++)
+		checksum += block[i];
+
+	return checksum == 0;
+}
+
+static int trigger2_fetch_edid(struct trigger2_device *trigger2,
+				u8 reply[TRIGGER2_REPLY_BUF_LEN])
+{
 	int idx, ret;
 
 	if (!drm_dev_enter(&trigger2->drm, &idx))
 		return -ENODEV;
 
-	ret = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0),
-			      TRIGGER2_REQUEST_GET_EDID,
-			      USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
-			      block, 0, buf, len, USB_CTRL_GET_TIMEOUT);
+	mutex_lock(&trigger2->cmd_lock);
+	ret = trigger2_edid_read_locked(trigger2, reply);
+	mutex_unlock(&trigger2->cmd_lock);
 	drm_dev_exit(idx);
+	return ret;
+}
 
-	if (ret < 0)
+static int trigger2_read_edid(void *data, u8 *buf, unsigned int block,
+			      size_t len)
+{
+	struct trigger2_device *trigger2 = data;
+	u8 reply[TRIGGER2_REPLY_BUF_LEN];
+	int ret;
+
+	if (len != EDID_LENGTH || block >= sizeof(reply) / EDID_LENGTH)
+		return -EINVAL;
+
+	ret = trigger2_fetch_edid(trigger2, reply);
+	if (ret)
 		return ret;
-	if (ret != len)
-		return -EIO;
 
+	/* IN81 is always 512 bytes, even when there is no usable EDID. */
+	if (drm_edid_header_is_valid(reply) != 8 ||
+	    !trigger2_edid_checksum_ok(reply))
+		return -EBADMSG;
+	if (reply[126] >= sizeof(reply) / EDID_LENGTH)
+		return -EOVERFLOW;
+	if (block > reply[126])
+		return -EINVAL;
+	if (block && !trigger2_edid_checksum_ok(reply + block * EDID_LENGTH))
+		return -EBADMSG;
+
+	memcpy(buf, reply + block * EDID_LENGTH, EDID_LENGTH);
 	return 0;
 }
 
@@ -53,25 +86,19 @@ static enum drm_connector_status
 trigger2_detect(struct drm_connector *connector, bool force)
 {
 	struct trigger2_device *trigger2 = to_trigger2(connector->dev);
-	struct usb_device *udev = interface_to_usbdev(trigger2->intf);
-	u8 status[2];
-	int idx, ret;
+	u8 reply[TRIGGER2_REPLY_BUF_LEN];
+	int ret;
 
-	if (!drm_dev_enter(&trigger2->drm, &idx))
-		return connector_status_disconnected;
-
-	ret = usb_control_msg_recv(udev, 0, TRIGGER2_REQUEST_GET_STATUS,
-				   USB_DIR_IN | USB_TYPE_VENDOR |
-					   USB_RECIP_DEVICE,
-				   0xff, 0x3, status, sizeof(status),
-				   USB_CTRL_GET_TIMEOUT, GFP_KERNEL);
-	drm_dev_exit(idx);
-
+	ret = trigger2_fetch_edid(trigger2, reply);
 	if (ret)
 		return connector_status_unknown;
-
-	return status[1] == 1 ? connector_status_connected :
-			     connector_status_disconnected;
+	if (drm_edid_header_is_valid(reply) == 8 &&
+	    trigger2_edid_checksum_ok(reply))
+		return connector_status_connected;
+	/* This adapter returns an all-ff base block while DDC/HPD is absent. */
+	if (!memchr_inv(reply, 0xff, EDID_LENGTH))
+		return connector_status_disconnected;
+	return connector_status_unknown;
 }
 
 static const struct drm_connector_helper_funcs trigger2_connector_helper_funcs = {
