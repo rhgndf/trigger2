@@ -8,6 +8,7 @@
 #include <linux/vmalloc.h>
 
 #include <drm/drm_atomic.h>
+#include <drm/drm_cache.h>
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_framebuffer.h>
@@ -18,7 +19,10 @@
 #include "trigger2.h"
 #include "trigger2_registers.h"
 
-#define TRIGGER2_CODEC_SCRATCH_SIZE	(3 * TRIGGER2_RGB_BLOCK_PIXELS)
+struct trigger2_codec_scratch {
+	__le32 pixels[TRIGGER2_RGB_BLOCK_PIXELS];
+	u8 channels[3][TRIGGER2_RGB_BLOCK_PIXELS];
+};
 
 void trigger2_stop_io(struct trigger2_device *trigger2)
 {
@@ -141,8 +145,8 @@ void trigger2_free_bulk_buffer(struct trigger2_transfer_buf *buf)
 
 int trigger2_alloc_bulk_buffer(struct trigger2_transfer_buf *buf, size_t len)
 {
-	/* Codec scratch follows the payload and is never sent over USB. */
-	buf->data = vmalloc(size_add(len, TRIGGER2_CODEC_SCRATCH_SIZE));
+	/* Framebuffer staging and codec scratch are never sent over USB. */
+	buf->data = vmalloc(size_add(len, sizeof(struct trigger2_codec_scratch)));
 	if (!buf->data)
 		return -ENOMEM;
 	buf->len = len;
@@ -312,42 +316,68 @@ static size_t trigger2_encode_frame(struct trigger2_transfer *transfer,
 				    const struct drm_rect *rect,
 				    const struct iosys_map *map)
 {
-	u8 (*channels)[TRIGGER2_RGB_BLOCK_PIXELS] =
+	struct trigger2_codec_scratch *scratch =
 		(void *)((u8 *)transfer->buf.data + transfer->buf.len);
+	u8 (*channels)[TRIGGER2_RGB_BLOCK_PIXELS] = scratch->channels;
+	struct drm_rect visible = DRM_RECT_INIT(dst->x1 - src->x1,
+						dst->y1 - src->y1,
+						state->fb->width, state->fb->height);
 	u8 *out = transfer->buf.data;
 	size_t total = (size_t)drm_rect_width(rect) * drm_rect_height(rect);
 	size_t pos, written = 0;
 	int x = rect->x1, y = rect->y1;
 	unsigned int i, c, n, run;
+	int count, first, last;
 	u32 pixel;
 	u8 value;
 
+	drm_rect_intersect(&visible, dst);
+
 	for (pos = 0; pos < total; pos += n) {
 		n = min_t(size_t, TRIGGER2_RGB_BLOCK_PIXELS, total - pos);
-		for (i = 0; i < n; i++) {
-			pixel = 0;
-			if (x >= dst->x1 && x < dst->x2 &&
-			    y >= dst->y1 && y < dst->y2) {
-				int sx = x - dst->x1 + src->x1;
-				int sy = y - dst->y1 + src->y1;
+		/*
+		 * Bulk reads let the WC helper use non-temporal loads where
+		 * available. Keep each block cached while splitting/compressing
+		 * its channels; never reread the framebuffer pixel by pixel.
+		 */
+		for (i = 0; i < n; i += count) {
+			count = min_t(int, n - i, rect->x2 - x);
+			first = max(x, visible.x1);
+			last = min(x + count, visible.x2);
+			if (y >= visible.y1 && y < visible.y2 && first < last) {
+				struct iosys_map src_map = *map;
+				struct iosys_map dst_map =
+					IOSYS_MAP_INIT_VADDR(scratch->pixels + i + first - x);
+				size_t offset =
+					(size_t)(y - dst->y1 + src->y1) * state->fb->pitches[0] +
+					(size_t)(first - dst->x1 + src->x1) * sizeof(__le32);
 
-				if (sx >= 0 && sy >= 0 &&
-				    sx < state->fb->width &&
-				    sy < state->fb->height)
-					pixel = iosys_map_rd(map,
-						(size_t)sy * state->fb->pitches[0] +
-						(size_t)sx * sizeof(u32), u32);
+				if (first != x)
+					memset(scratch->pixels + i, 0,
+					       (first - x) * sizeof(__le32));
+				iosys_map_incr(&src_map, offset);
+				drm_memcpy_from_wc(&dst_map, &src_map,
+						   (last - first) * sizeof(__le32));
+				if (last != x + count)
+					memset(scratch->pixels + i + last - x, 0,
+					       (x + count - last) * sizeof(__le32));
+			} else {
+				memset(scratch->pixels + i, 0, count * sizeof(__le32));
 			}
+			x += count;
+			if (x == rect->x2) {
+				x = rect->x1;
+				y++;
+			}
+		}
+		for (i = 0; i < n; i++) {
+			pixel = le32_to_cpu(scratch->pixels[i]);
 			channels[0][i] = (pixel >> 16) & 0xff;
 			channels[1][i] = (pixel >> 8) & 0xff;
 			channels[2][i] = pixel & 0xff;
 			for (c = 0; c < 3; c++)
 				if (channels[c][i] == 0x30)
 					channels[c][i] = 0x31;
-			if (++x == rect->x2) {
-				x = rect->x1;
-				y++;
-			}
 		}
 
 		for (c = 0; c < 3; c++) {
