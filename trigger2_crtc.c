@@ -33,52 +33,53 @@ static const struct drm_mode_config_funcs trigger2_mode_config_funcs = {
 };
 
 struct trigger2_clock {
-	u8 divider;
-	u8 multiplier;
-	u8 band;
-	u8 range;
+	u8 f3;
+	u8 f4;
+	u8 f5;
+	u8 f6;
+	u8 f7;
 };
 
 /*
- * Captures give 12 MHz * F4 * F7 / F3. Keep observed F3/F5 pairs;
- * equivalent products need not give equivalent PLL operating points.
+ * Measured loop ordering: 12 MHz * F7/F6, then pixel clock = first * F4/F3.
+ * F5 bits 4/0 select first/output loop bands. Leave bit 4 clear.
+ * Switch output bands at 50 MHz; the high-band floor is about 45 MHz.
+ * Restrict F6 to 1..4: wider divider settings have not always locked.
  */
-static const struct {
-	u8 divider, band, multiplier, range;
-} settings[] = {
-	{ 12, 0, 13, 5 }, { 48, 16, 23, 17 }, { 6, 1, 11, 7 },
-};
-
 static u32 trigger2_calculate_clock(struct trigger2_clock *clock, u32 target)
 {
-	u32 best = U32_MAX, best_distance = U32_MAX;
-	u32 actual, error, distance;
-	unsigned int i, multiplier, range;
+	u64 best_error = 0, error, scaled_target;
+	u32 best_divisor = 0, divisor, numerator;
+	unsigned int f3, f4, f6, f7;
 
-	for (i = 0; i < ARRAY_SIZE(settings); i++) {
-		for (multiplier = 1; multiplier <= 63; multiplier++) {
-			for (range = 1; range <= 31; range++) {
-				actual = DIV_ROUND_CLOSEST(12000 * multiplier *
-							  range, settings[i].divider);
-				error = abs_diff(actual, target);
-				distance = abs_diff(multiplier,
-						    (unsigned int)settings[i].multiplier) +
-					   abs_diff(range,
-						    (unsigned int)settings[i].range);
-				if (error > best ||
-				    (error == best && distance >= best_distance))
-					continue;
-				best = error;
-				best_distance = distance;
-				clock->divider = settings[i].divider;
-				clock->multiplier = multiplier;
-				clock->band = settings[i].band;
-				clock->range = range;
+	clock->f5 = target >= 50000;
+	for (f3 = 1; f3 <= 63; f3++) {
+		for (f6 = 1; f6 <= 4; f6++) {
+			divisor = f3 * f6;
+			scaled_target = (u64)target * divisor;
+			for (f4 = 1; f4 <= 63; f4++) {
+				for (f7 = 1; f7 <= 31; f7++) {
+					numerator = 12000 * f4 * f7;
+					error = abs_diff((u64)numerator,
+							 scaled_target);
+					if (best_divisor &&
+					    error * best_divisor >=
+					    best_error * divisor)
+						continue;
+					best_error = error;
+					best_divisor = divisor;
+					clock->f3 = f3;
+					clock->f4 = f4;
+					clock->f6 = f6;
+					clock->f7 = f7;
+					if (!error)
+						return 0;
+				}
 			}
 		}
 	}
 
-	return best;
+	return DIV_ROUND_CLOSEST_ULL(best_error, best_divisor);
 }
 
 /*
@@ -486,11 +487,11 @@ static int trigger2_program_mode_locked(struct trigger2_device *trigger2,
 		return ret;
 
 	trigger2_calculate_clock(&clock, mode->clock);
-	pll[3] = 0xf3; pll[4] = clock.divider;
-	pll[5] = 0xf4; pll[6] = clock.multiplier;
-	pll[7] = 0xf6; pll[8] = 1;
-	pll[9] = 0xf7; pll[10] = clock.range;
-	pll[11] = 0xf5; pll[12] = clock.band;
+	pll[3] = 0xf3; pll[4] = clock.f3;
+	pll[5] = 0xf4; pll[6] = clock.f4;
+	pll[7] = 0xf6; pll[8] = clock.f6;
+	pll[9] = 0xf7; pll[10] = clock.f7;
+	pll[11] = 0xf5; pll[12] = clock.f5;
 	pll[13] = 0x4b; pll[14] = 7;
 	ret = trigger2_command_locked(trigger2, 3, pll, sizeof(pll));
 	if (ret)
