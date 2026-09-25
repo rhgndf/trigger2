@@ -2,8 +2,11 @@
 #ifndef __TRIGGER2_H__
 #define __TRIGGER2_H__
 
+#include <linux/align.h>
 #include <linux/atomic.h>
+#include <linux/bitops.h>
 #include <linux/completion.h>
+#include <linux/minmax.h>
 #include <linux/mutex.h>
 #include <linux/types.h>
 #include <linux/version.h>
@@ -30,6 +33,7 @@
 #define TRIGGER2_BULK_TIMEOUT_MS	5000
 #define TRIGGER2_BULK_CHUNK_SIZE	(20 * 1024)
 #define TRIGGER2_BULK_URBS	4
+#define TRIGGER2_RGB_BLOCK_PIXELS	1024
 
 struct trigger2_transfer_buf {
 	void *data;
@@ -102,6 +106,22 @@ static inline struct trigger2_crtc_state *
 to_trigger2_crtc_state(struct drm_crtc_state *state)
 {
 	return container_of(state, struct trigger2_crtc_state, base);
+}
+
+/* Keep complete 1024-pixel RGB blocks, including clipped right-edge damage. */
+static inline unsigned int trigger2_frame_row_align(unsigned int width)
+{
+	unsigned int rows = TRIGGER2_RGB_BLOCK_PIXELS >>
+		__ffs(width | TRIGGER2_RGB_BLOCK_PIXELS);
+
+	/* The low set bit gives gcd(width, block size); retain 16-row banks. */
+	return max(16U, rows);
+}
+
+static inline unsigned int trigger2_padded_height(unsigned int width,
+						  unsigned int height)
+{
+	return ALIGN(height, trigger2_frame_row_align(width));
 }
 
 int trigger2_command_locked(struct trigger2_device *trigger2, u8 endpoint,

@@ -18,7 +18,6 @@
 #include "trigger2.h"
 #include "trigger2_registers.h"
 
-#define TRIGGER2_RGB_BLOCK_PIXELS	1024
 #define TRIGGER2_CODEC_SCRATCH_SIZE	(3 * TRIGGER2_RGB_BLOCK_PIXELS)
 
 void trigger2_stop_io(struct trigger2_device *trigger2)
@@ -184,16 +183,17 @@ int trigger2_transfer_mode_init(struct trigger2_device *trigger2,
 	struct trigger2_transfer *transfer = &trigger2->transfers[0];
 	struct usb_device *udev = interface_to_usbdev(trigger2->intf);
 	u32 width = mode->hdisplay, height = mode->vdisplay;
+	u32 padded_height = trigger2_padded_height(width, height);
 	u64 pixels = (u64)width * height;
 	u64 bound = (u64)trigger2->frame_base +
-		    9 * (u64)width * ALIGN(height, 16);
+		    9 * (u64)width * padded_height;
 	size_t bitmap_len = pixels / 8;
 	u8 *setup = transfer->header;
 	int actual, ret;
 
 	/* Quarter dimensions and bitmap bytes must be exact on the wire. */
 	if (!width || !height || ((width | height) & 3) ||
-	    width > U16_MAX || height > U16_MAX - 15 ||
+	    width > U16_MAX || padded_height > U16_MAX ||
 	    pixels > (U32_MAX - 4) / 32 ||
 	    3 * pixels > 0xffffff || bound > U32_MAX ||
 	    bound != trigger2->frame_end || bitmap_len > transfer->buf.len)
@@ -257,7 +257,8 @@ int trigger2_transfer_blank_frame(struct trigger2_device *trigger2,
 	unsigned int c;
 	int actual, ret;
 
-	if (3 * pixels > transfer->buf.len || 3 * pixels > 0xffffff)
+	if ((pixels & (TRIGGER2_RGB_BLOCK_PIXELS - 1)) ||
+	    3 * pixels > transfer->buf.len || 3 * pixels > 0xffffff)
 		return -EINVAL;
 
 	for (pos = 0; pos < pixels; pos += n) {
@@ -385,7 +386,7 @@ void trigger2_plane_atomic_update(struct drm_plane *plane,
 	struct drm_rect current_rect, damage_rect, src_rect, dst_rect;
 	u64 addr, end;
 	size_t raw_len, frame_len;
-	int width, height, padded_height;
+	int width, height, padded_height, row_align;
 	int idx, ret, generation;
 
 	if (!drm_atomic_helper_damage_merged(old_state, state, &current_rect))
@@ -426,7 +427,7 @@ void trigger2_plane_atomic_update(struct drm_plane *plane,
 		goto exit;
 	damage_rect = current_rect;
 
-	padded_height = ALIGN(mode->vdisplay, 16);
+	padded_height = trigger2_padded_height(mode->hdisplay, mode->vdisplay);
 	/*
 	 * Partial frames use screen coordinates and full-frame stride. Send
 	 * a full frame if the plane is offset or cropped, so its uncovered
@@ -444,8 +445,14 @@ void trigger2_plane_atomic_update(struct drm_plane *plane,
 		current_rect.x1 = round_down(current_rect.x1, 64);
 		current_rect.x2 = min_t(int, round_up(current_rect.x2, 64),
 					mode->hdisplay);
-		current_rect.y1 = round_down(current_rect.y1, 16);
-		current_rect.y2 = min_t(int, round_up(current_rect.y2, 16),
+		/* Preserve partial-frame width granularity when clipping the right
+		 * edge. A full-width frame can instead use padded rows.
+		 */
+		current_rect.x1 = max(0, current_rect.x2 -
+				round_up(drm_rect_width(&current_rect), 64));
+		row_align = trigger2_frame_row_align(drm_rect_width(&current_rect));
+		current_rect.y1 = round_down(current_rect.y1, row_align);
+		current_rect.y2 = min_t(int, round_up(current_rect.y2, row_align),
 					padded_height);
 	}
 

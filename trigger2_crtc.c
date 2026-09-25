@@ -4,6 +4,7 @@
 #include <linux/err.h>
 #include <linux/math.h>
 #include <linux/math64.h>
+#include <linux/minmax.h>
 #include <linux/overflow.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
@@ -42,23 +43,27 @@ struct trigger2_clock {
 
 /*
  * Measured loop ordering: 12 MHz * F7/F6, then pixel clock = first * F4/F3.
- * F5 bits 4/0 select first/output loop bands. Leave bit 4 clear.
- * Switch output bands at 50 MHz; the high-band floor is about 45 MHz.
- * Restrict F6 to 1..4: wider divider settings have not always locked.
+ * F5 bits 4/0 select first/output loop bands, each switched at 50 MHz.
+ * The high-band lower plateaus are about 42/45 MHz respectively.
+ * Keep the first loop at or below 600 MHz, below its ~667 MHz high-band
+ * ceiling. F6=1..4 keeps its reference input at 3..12 MHz.
+ * At equal error and F3, try smaller F4 before F6 to keep the output-loop
+ * reference higher (pixel clock / F4).
  */
 static u32 trigger2_calculate_clock(struct trigger2_clock *clock, u32 target)
 {
 	u64 best_error = 0, error, scaled_target;
 	u32 best_divisor = 0, divisor, numerator;
-	unsigned int f3, f4, f6, f7;
+	unsigned int f3, f4, f6, f7, max_f7;
+	u8 output_band = target >= 50000;
 
-	clock->f5 = target >= 50000;
 	for (f3 = 1; f3 <= 63; f3++) {
-		for (f6 = 1; f6 <= 4; f6++) {
-			divisor = f3 * f6;
-			scaled_target = (u64)target * divisor;
-			for (f4 = 1; f4 <= 63; f4++) {
-				for (f7 = 1; f7 <= 31; f7++) {
+		for (f4 = 1; f4 <= 63; f4++) {
+			for (f6 = 1; f6 <= 4; f6++) {
+				divisor = f3 * f6;
+				scaled_target = (u64)target * divisor;
+				max_f7 = min(63U, 50 * f6);
+				for (f7 = 1; f7 <= max_f7; f7++) {
 					numerator = 12000 * f4 * f7;
 					error = abs_diff((u64)numerator,
 							 scaled_target);
@@ -72,6 +77,8 @@ static u32 trigger2_calculate_clock(struct trigger2_clock *clock, u32 target)
 					clock->f4 = f4;
 					clock->f6 = f6;
 					clock->f7 = f7;
+					clock->f5 = output_band |
+						(12 * f7 >= 50 * f6 ? 0x10 : 0);
 					if (!error)
 						return 0;
 				}
@@ -183,7 +190,8 @@ static void trigger2_crtc_destroy_state(struct drm_crtc *crtc,
 
 static size_t trigger2_mode_buf_len(const struct drm_display_mode *mode)
 {
-	return array3_size(mode->hdisplay, ALIGN(mode->vdisplay, 16), 3);
+	return array3_size(mode->hdisplay,
+			  trigger2_padded_height(mode->hdisplay, mode->vdisplay), 3);
 }
 
 static int trigger2_crtc_atomic_check(struct drm_crtc *crtc,
@@ -575,7 +583,7 @@ static int trigger2_program_mode_locked(struct trigger2_device *trigger2,
 	if (ret)
 		return ret;
 	ret = trigger2_transfer_blank_frame(trigger2, mode->hdisplay,
-					    mode->vdisplay);
+			trigger2_padded_height(mode->hdisplay, mode->vdisplay));
 	if (ret)
 		return ret;
 	ret = trigger2_transfer_blank_frame(trigger2, 64, 16);
@@ -657,7 +665,7 @@ trigger2_crtc_mode_valid(struct drm_crtc *crtc,
 	if (mode->flags & (DRM_MODE_FLAG_INTERLACE | DRM_MODE_FLAG_DBLSCAN))
 		return MODE_BAD;
 
-	pixels = (u64)width * ALIGN(height, 16);
+	pixels = (u64)width * trigger2_padded_height(width, height);
 	if (0xc000 + 9 * pixels > SZ_32M)
 		return MODE_MEM;
 	if (!mode->clock || mode->clock > 200000)
