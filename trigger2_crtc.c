@@ -645,11 +645,11 @@ trigger2_crtc_mode_valid(struct drm_crtc *crtc,
 	u64 pixels;
 	u32 error;
 
-	if (width < 64 || width > 2048 || (width & 3) ||
+	if (width < 64 || (width & 3) ||
 	    !hsync || hsync > 256 || !hback || hback > 256 ||
 	    mode->htotal > U16_MAX)
 		return MODE_H_ILLEGAL;
-	if (height < 16 || height > 1536 || (height & 3) ||
+	if (height < 16 || (height & 3) ||
 	    !vsync || vsync > 256 || !vback || vback > 256 ||
 	    mode->vtotal > U16_MAX)
 		return MODE_V_ILLEGAL;
@@ -657,8 +657,7 @@ trigger2_crtc_mode_valid(struct drm_crtc *crtc,
 		return MODE_BAD;
 
 	pixels = (u64)width * ALIGN(height, 16);
-	if (3 * pixels > 0xffffff || 0xc000 + 9 * pixels > SZ_32M ||
-	    (u64)width * height * 32 + 4 > U32_MAX)
+	if (0xc000 + 9 * pixels > SZ_32M)
 		return MODE_MEM;
 	if (!mode->clock || mode->clock > 200000)
 		return MODE_CLOCK_RANGE;

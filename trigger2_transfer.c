@@ -23,7 +23,7 @@
 
 void trigger2_stop_io(struct trigger2_device *trigger2)
 {
-	/* Callers drain work before taking cmd_lock for mode programming. */
+	/* Drain ordered EP02 frame work before a mode uses the same endpoint. */
 	WRITE_ONCE(trigger2->display_enabled, false);
 	atomic_inc(&trigger2->io_generation);
 	flush_workqueue(trigger2->transfer_wq);
@@ -110,12 +110,11 @@ static void trigger2_transfer_work(struct work_struct *work)
 	if (!drm_dev_enter(&trigger2->drm, &idx))
 		goto complete;
 
-	mutex_lock(&trigger2->cmd_lock);
 	if (!READ_ONCE(trigger2->display_enabled) ||
 	    transfer->generation != atomic_read(&trigger2->io_generation))
-		goto unlock;
+		goto exit;
 
-	/* Both stages use EP02; the descriptor must precede the payload URBs. */
+	/* The ordered workqueue keeps frame descriptors ahead of their payloads. */
 	ret = usb_bulk_msg(udev, trigger2->bulk_pipe, transfer->header,
 			   TRIGGER2_FRAME_HEADER_LEN, &actual,
 			   TRIGGER2_BULK_TIMEOUT_MS);
@@ -126,8 +125,7 @@ static void trigger2_transfer_work(struct work_struct *work)
 					 transfer->frame_len);
 	if (ret)
 		drm_err_ratelimited(&trigger2->drm, "USB frame failed: %d\n", ret);
-unlock:
-	mutex_unlock(&trigger2->cmd_lock);
+exit:
 	drm_dev_exit(idx);
 complete:
 	complete(&transfer->frame_complete);
