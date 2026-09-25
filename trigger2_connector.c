@@ -37,42 +37,53 @@ static int trigger2_fetch_edid(struct trigger2_device *trigger2,
 	return ret;
 }
 
+struct trigger2_edid_read {
+	struct trigger2_device *trigger2;
+	bool fetched;
+	u8 reply[TRIGGER2_REPLY_BUF_LEN];
+};
+
 static int trigger2_read_edid(void *data, u8 *buf, unsigned int block,
 			      size_t len)
 {
-	struct trigger2_device *trigger2 = data;
-	u8 reply[TRIGGER2_REPLY_BUF_LEN];
+	struct trigger2_edid_read *ctx = data;
 	int ret;
 
-	if (len != EDID_LENGTH || block >= sizeof(reply) / EDID_LENGTH)
+	if (len != EDID_LENGTH ||
+	    block >= ARRAY_SIZE(ctx->reply) / EDID_LENGTH)
 		return -EINVAL;
 
-	ret = trigger2_fetch_edid(trigger2, reply);
-	if (ret)
-		return ret;
-
-	/* IN81 is always 512 bytes, even when there is no usable EDID. */
-	if (drm_edid_header_is_valid(reply) != 8 ||
-	    !trigger2_edid_checksum_ok(reply))
-		return -EBADMSG;
-	if (reply[126] >= sizeof(reply) / EDID_LENGTH)
-		return -EOVERFLOW;
-	if (block > reply[126])
+	if (!ctx->fetched) {
+		ret = trigger2_fetch_edid(ctx->trigger2, ctx->reply);
+		if (ret)
+			return ret;
+		/* IN81 returns 512 bytes even without a usable EDID. */
+		if (drm_edid_header_is_valid(ctx->reply) != 8 ||
+		    !trigger2_edid_checksum_ok(ctx->reply))
+			return -EBADMSG;
+		if (ctx->reply[126] >= sizeof(ctx->reply) / EDID_LENGTH)
+			return -EOVERFLOW;
+		ctx->fetched = true;
+	}
+	if (block > ctx->reply[126])
 		return -EINVAL;
-	if (block && !trigger2_edid_checksum_ok(reply + block * EDID_LENGTH))
+	if (block && !trigger2_edid_checksum_ok(ctx->reply +
+						 block * EDID_LENGTH))
 		return -EBADMSG;
 
-	memcpy(buf, reply + block * EDID_LENGTH, EDID_LENGTH);
+	memcpy(buf, ctx->reply + block * EDID_LENGTH, EDID_LENGTH);
 	return 0;
 }
 
 static int trigger2_connector_get_modes(struct drm_connector *connector)
 {
-	struct trigger2_device *trigger2 = to_trigger2(connector->dev);
+	struct trigger2_edid_read ctx = {
+		.trigger2 = to_trigger2(connector->dev),
+	};
 	const struct drm_edid *edid;
 	int count;
 
-	edid = drm_edid_read_custom(connector, trigger2_read_edid, trigger2);
+	edid = drm_edid_read_custom(connector, trigger2_read_edid, &ctx);
 	drm_edid_connector_update(connector, edid);
 	count = drm_edid_connector_add_modes(connector);
 	if (!count)

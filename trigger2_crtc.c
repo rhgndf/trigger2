@@ -394,8 +394,11 @@ static int trigger2_program_mode_locked(struct trigger2_device *trigger2,
 		  mode->vsync_end - mode->vsync_start - 1 },
 		{ TRIGGER2_REG_VTOTAL_LO, mode->vtotal - 1 },
 		{ TRIGGER2_REG_VTOTAL_HI, (mode->vtotal - 1) >> 8 },
-		{ TRIGGER2_REG_FC6F, mode->hdisplay >= 1920 ? 2 :
-			   mode->hdisplay >= 1600 ? 0 : 3 },
+		{ TRIGGER2_REG_FC6F,
+		  (mode->flags & DRM_MODE_FLAG_NHSYNC ?
+		   TRIGGER2_FC6F_NEG_HSYNC : 0) |
+		  (mode->flags & DRM_MODE_FLAG_NVSYNC ?
+		   TRIGGER2_FC6F_NEG_VSYNC : 0) },
 	};
 	u8 geometry[35] = { TRIGGER2_CMD_GEOMETRY, 0x20, 0 };
 	u8 pll[15] = { TRIGGER2_CMD_REG_PAIRS, 0x0c, 0 };
