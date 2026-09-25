@@ -129,6 +129,71 @@ struct trigger2_boot_reg {
 	u8 value;
 };
 
+static const u8 info[] = { TRIGGER2_CMD_BOOT_INFO, 0x00, 0x02, 0x00 };
+static const u8 identity[] = {
+	TRIGGER2_CMD_BOOT_ID, 0x80, 0x00, 0xae, 0x00, 0x00, 0x01, 0x00
+};
+static const u8 config_a[] = {
+	TRIGGER2_CMD_BOOT_CONFIG, 0x04, 0x04, 0x00,
+	0x00, 0x06, 0x1a, 0x80
+};
+static const u8 config_b[] = {
+	TRIGGER2_CMD_BOOT_CONFIG, 0x03, 0x01, 0x00, 0x00
+};
+static const u8 config_c[] = {
+	TRIGGER2_CMD_BOOT_CONFIG, 0x08, 0x01, 0x00, 0x02
+};
+static const u8 board_pairs[] = {
+	TRIGGER2_CMD_REG_PAIRS, 0x0c, 0x00,
+	0xa4, 0x39, 0xa5, 0x00, 0xa6, 0x00, 0xa7, 0x00,
+	0xa3, 0x65, 0xa3, 0x64
+};
+static const u8 bitmap[] = {
+	TRIGGER2_CMD_BITMAP, 0x00, 0x00, 0x00, 0x00,
+	0x20, 0x00, 0x01, 0x00, 0x20, 0x00, 0x01,
+	0x00, 0x00, 0x40, 0x00, 0x40, 0x00, 0x60,
+	0x00, 0x00
+};
+static const struct trigger2_boot_reg reset[] = {
+	{ TRIGGER2_REG_FE57, 0xa0 },
+	{ TRIGGER2_REG_FE57, 0x20 },
+	{ TRIGGER2_REG_FE70, 0x80 },
+	{ TRIGGER2_REG_FE70, 0x00 },
+	{ TRIGGER2_REG_FE36, 0x20 },
+	{ TRIGGER2_REG_FE36, 0x00 },
+	{ TRIGGER2_REG_FC6F, 0x00 },
+};
+static const struct trigger2_boot_reg channel_setup[] = {
+	{ TRIGGER2_REG_FC6A, 0x12 }, { TRIGGER2_REG_FC6B, 0x22 },
+	{ TRIGGER2_REG_FC6A, 0x13 }, { TRIGGER2_REG_FC6B, 0x22 },
+	{ TRIGGER2_REG_FC6A, 0x11 }, { TRIGGER2_REG_FC6B, 0x22 },
+	{ TRIGGER2_REG_FC6A, 0x10 }, { TRIGGER2_REG_FC6B, 0x22 },
+	{ TRIGGER2_REG_FBFF, 0x81 },
+};
+static const struct trigger2_boot_reg pre_bitmap[] = {
+	{ TRIGGER2_REG_FCB0, 0x20 },
+	{ TRIGGER2_REG_FC4B, 0x0e },
+	{ TRIGGER2_REG_FBF2, 0x04 },
+	{ TRIGGER2_REG_FCA2, 0x10 },
+	{ TRIGGER2_REG_FBF4, 0x03 },
+	{ TRIGGER2_REG_FCF0, 0x01 },
+	{ TRIGGER2_REG_FCF1, 0x1c },
+	{ TRIGGER2_REG_FCF2, 0x01 },
+	{ TRIGGER2_REG_FC4B, 0x02 },
+};
+static const struct trigger2_boot_reg channel_reset[] = {
+	{ TRIGGER2_REG_CHANNEL_RESET, 0x00 },
+	{ TRIGGER2_REG_CHANNEL_70, 0x00 },
+	{ TRIGGER2_REG_CHANNEL_71, 0x00 },
+	{ TRIGGER2_REG_CHANNEL_72, 0x00 },
+	{ TRIGGER2_REG_CHANNEL_74, 0x00 },
+	{ TRIGGER2_REG_CHANNEL_75, 0x00 },
+	{ TRIGGER2_REG_CHANNEL_76, 0x00 },
+	{ TRIGGER2_REG_FEA8, 0x00 },
+	{ TRIGGER2_REG_FEA9, 0x00 },
+	{ TRIGGER2_REG_FEAA, 0x00 },
+};
+
 static int trigger2_boot_writes_locked(struct trigger2_device *trigger2,
 				       const struct trigger2_boot_reg *writes,
 				       size_t count)
@@ -169,70 +234,6 @@ static int trigger2_boot_reply_locked(struct trigger2_device *trigger2,
 
 int trigger2_boot_locked(struct trigger2_device *trigger2)
 {
-	static const u8 info[] = { TRIGGER2_CMD_BOOT_INFO, 0x00, 0x02, 0x00 };
-	static const u8 identity[] = {
-		TRIGGER2_CMD_BOOT_ID, 0x80, 0x00, 0xae, 0x00, 0x00, 0x01, 0x00
-	};
-	static const u8 config_a[] = {
-		TRIGGER2_CMD_BOOT_CONFIG, 0x04, 0x04, 0x00,
-		0x00, 0x06, 0x1a, 0x80
-	};
-	static const u8 config_b[] = {
-		TRIGGER2_CMD_BOOT_CONFIG, 0x03, 0x01, 0x00, 0x00
-	};
-	static const u8 config_c[] = {
-		TRIGGER2_CMD_BOOT_CONFIG, 0x08, 0x01, 0x00, 0x02
-	};
-	static const u8 board_pairs[] = {
-		TRIGGER2_CMD_REG_PAIRS, 0x0c, 0x00,
-		0xa4, 0x39, 0xa5, 0x00, 0xa6, 0x00, 0xa7, 0x00,
-		0xa3, 0x65, 0xa3, 0x64
-	};
-	static const u8 bitmap[] = {
-		TRIGGER2_CMD_BITMAP, 0x00, 0x00, 0x00, 0x00,
-		0x20, 0x00, 0x01, 0x00, 0x20, 0x00, 0x01,
-		0x00, 0x00, 0x40, 0x00, 0x40, 0x00, 0x60,
-		0x00, 0x00
-	};
-	static const struct trigger2_boot_reg reset[] = {
-		{ TRIGGER2_REG_FE57, 0xa0 },
-		{ TRIGGER2_REG_FE57, 0x20 },
-		{ TRIGGER2_REG_FE70, 0x80 },
-		{ TRIGGER2_REG_FE70, 0x00 },
-		{ TRIGGER2_REG_FE36, 0x20 },
-		{ TRIGGER2_REG_FE36, 0x00 },
-		{ TRIGGER2_REG_FC6F, 0x00 },
-	};
-	static const struct trigger2_boot_reg channel_setup[] = {
-		{ TRIGGER2_REG_FC6A, 0x12 }, { TRIGGER2_REG_FC6B, 0x22 },
-		{ TRIGGER2_REG_FC6A, 0x13 }, { TRIGGER2_REG_FC6B, 0x22 },
-		{ TRIGGER2_REG_FC6A, 0x11 }, { TRIGGER2_REG_FC6B, 0x22 },
-		{ TRIGGER2_REG_FC6A, 0x10 }, { TRIGGER2_REG_FC6B, 0x22 },
-		{ TRIGGER2_REG_FBFF, 0x81 },
-	};
-	static const struct trigger2_boot_reg pre_bitmap[] = {
-		{ TRIGGER2_REG_FCB0, 0x20 },
-		{ TRIGGER2_REG_FC4B, 0x0e },
-		{ TRIGGER2_REG_FBF2, 0x04 },
-		{ TRIGGER2_REG_FCA2, 0x10 },
-		{ TRIGGER2_REG_FBF4, 0x03 },
-		{ TRIGGER2_REG_FCF0, 0x01 },
-		{ TRIGGER2_REG_FCF1, 0x1c },
-		{ TRIGGER2_REG_FCF2, 0x01 },
-		{ TRIGGER2_REG_FC4B, 0x02 },
-	};
-	static const struct trigger2_boot_reg channel_reset[] = {
-		{ TRIGGER2_REG_CHANNEL_RESET, 0x00 },
-		{ TRIGGER2_REG_CHANNEL_70, 0x00 },
-		{ TRIGGER2_REG_CHANNEL_71, 0x00 },
-		{ TRIGGER2_REG_CHANNEL_72, 0x00 },
-		{ TRIGGER2_REG_CHANNEL_74, 0x00 },
-		{ TRIGGER2_REG_CHANNEL_75, 0x00 },
-		{ TRIGGER2_REG_CHANNEL_76, 0x00 },
-		{ TRIGGER2_REG_FEA8, 0x00 },
-		{ TRIGGER2_REG_FEA9, 0x00 },
-		{ TRIGGER2_REG_FEAA, 0x00 },
-	};
 	u8 pairs[3 + 10 * 4];
 	unsigned int i;
 	int ret;

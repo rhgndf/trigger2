@@ -2,9 +2,9 @@
 #ifndef __TRIGGER2_H__
 #define __TRIGGER2_H__
 
+#include <linux/atomic.h>
 #include <linux/completion.h>
 #include <linux/mutex.h>
-#include <linux/timer.h>
 #include <linux/types.h>
 #include <linux/version.h>
 #include <linux/usb.h>
@@ -28,10 +28,18 @@
 #define TRIGGER2_REPLY_BUF_LEN	512
 #define TRIGGER2_FRAME_HEADER_LEN	36
 #define TRIGGER2_BULK_TIMEOUT_MS	5000
+#define TRIGGER2_BULK_CHUNK_SIZE	(20 * 1024)
+#define TRIGGER2_BULK_URBS	4
 
 struct trigger2_transfer_buf {
 	void *data;
 	size_t len;
+};
+
+struct trigger2_bulk_chunk {
+	struct urb *urb;
+	void *data;
+	struct completion complete;
 };
 
 struct trigger2_transfer {
@@ -39,12 +47,13 @@ struct trigger2_transfer {
 
 	struct trigger2_transfer_buf buf;
 	size_t frame_len;
+	int generation;
 	struct drm_rect transfer_rect;
 
 	u8 *header;
 
-	struct timer_list timer;
-	struct usb_sg_request sgr;
+	struct trigger2_bulk_chunk chunks[TRIGGER2_BULK_URBS];
+	struct usb_anchor submitted;
 
 	struct work_struct transfer_work;
 	struct completion frame_complete;
@@ -72,6 +81,7 @@ struct trigger2_device {
 	struct drm_rect pending_rect;
 	struct workqueue_struct *transfer_wq;
 	bool display_enabled;
+	atomic_t io_generation;
 	bool mode_programmed;
 
 	struct trigger2_transfer transfers[TRIGGER2_NUM_TRANSFERS];
@@ -107,7 +117,8 @@ int trigger2_boot_locked(struct trigger2_device *trigger2);
 
 int trigger2_alloc_bulk_buffer(struct trigger2_transfer_buf *buf, size_t len);
 void trigger2_free_bulk_buffer(struct trigger2_transfer_buf *buf);
-void trigger2_transfer_init(struct trigger2_device *trigger2);
+int trigger2_transfer_init(struct trigger2_device *trigger2);
+void trigger2_transfer_fini(struct trigger2_device *trigger2);
 void trigger2_stop_io(struct trigger2_device *trigger2);
 int trigger2_transfer_mode_init(struct trigger2_device *trigger2,
 			       const struct drm_display_mode *mode);

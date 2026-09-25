@@ -39,17 +39,18 @@ struct trigger2_clock {
 	u8 range;
 };
 
+/*
+ * Captures give 12 MHz * F4 * F7 / F3. Keep observed F3/F5 pairs;
+ * equivalent products need not give equivalent PLL operating points.
+ */
+static const struct {
+	u8 divider, band, multiplier, range;
+} settings[] = {
+	{ 12, 0, 13, 5 }, { 48, 16, 23, 17 }, { 6, 1, 11, 7 },
+};
+
 static u32 trigger2_calculate_clock(struct trigger2_clock *clock, u32 target)
 {
-	/*
-	 * Captures give 12 MHz * F4 * F7 / F3. Keep observed F3/F5 pairs;
-	 * equivalent products need not give equivalent PLL operating points.
-	 */
-	static const struct {
-		u8 divider, band, multiplier, range;
-	} settings[] = {
-		{ 12, 0, 13, 5 }, { 48, 16, 23, 17 }, { 6, 1, 11, 7 },
-	};
 	u32 best = U32_MAX, best_distance = U32_MAX;
 	u32 actual, error, distance;
 	unsigned int i, multiplier, range;

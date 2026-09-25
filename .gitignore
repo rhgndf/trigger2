@@ -14,3 +14,5 @@ modules.order
 .cache.mk
 *.pcapng
 tmp/
+RegisterMap.md
+read-trigger2-registers.py

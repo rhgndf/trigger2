@@ -131,12 +131,14 @@ static int trigger2_usb_probe(struct usb_interface *interface,
 	if (ret)
 		return ret;
 
-	trigger2_transfer_init(trigger2);
+	ret = trigger2_transfer_init(trigger2);
+	if (ret)
+		return ret;
 
 	trigger2->transfer_wq = alloc_ordered_workqueue(DRIVER_NAME, 0);
 	if (!trigger2->transfer_wq) {
 		ret = -ENOMEM;
-		return ret;
+		goto err_transfer_fini;
 	}
 
 	drm_mode_config_reset(dev);
@@ -157,6 +159,8 @@ err_poll_fini:
 	drm_kms_helper_poll_fini(dev);
 	usb_set_intfdata(interface, NULL);
 	destroy_workqueue(trigger2->transfer_wq);
+err_transfer_fini:
+	trigger2_transfer_fini(trigger2);
 	return ret;
 }
 
@@ -170,6 +174,7 @@ static void trigger2_usb_disconnect(struct usb_interface *interface)
 	drm_atomic_helper_shutdown(dev);
 	trigger2_stop_io(trigger2);
 	destroy_workqueue(trigger2->transfer_wq);
+	trigger2_transfer_fini(trigger2);
 	trigger2_free_bulk_buffer(&trigger2->transfers[0].buf);
 	trigger2_free_bulk_buffer(&trigger2->transfers[1].buf);
 }
