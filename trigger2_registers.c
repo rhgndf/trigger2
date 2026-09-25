@@ -15,7 +15,6 @@ int trigger2_command_locked(struct trigger2_device *trigger2, u8 endpoint,
 			    const void *buf, size_t len)
 {
 	struct usb_device *udev = interface_to_usbdev(trigger2->intf);
-	unsigned int pipe;
 	int actual, ret;
 
 	lockdep_assert_held(&trigger2->cmd_lock);
@@ -25,20 +24,15 @@ int trigger2_command_locked(struct trigger2_device *trigger2, u8 endpoint,
 	if (len > TRIGGER2_CMD_BUF_LEN)
 		return -EMSGSIZE;
 
-	if (endpoint == 2)
-		pipe = trigger2->bulk_pipe;
-	else if (endpoint == 3)
-		pipe = trigger2->cmd_pipe;
-	else if (endpoint == 4)
-		pipe = trigger2->aux_pipe;
-	else
+	if (endpoint < 2 || endpoint > 4)
 		return -EINVAL;
 
 	/* Callers may pass stack data; cmd_buf is persistent DMA-safe storage. */
 	if (buf != trigger2->cmd_buf)
 		memcpy(trigger2->cmd_buf, buf, len);
 
-	ret = usb_bulk_msg(udev, pipe, trigger2->cmd_buf, len, &actual,
+	ret = usb_bulk_msg(udev, usb_sndbulkpipe(udev, endpoint),
+			   trigger2->cmd_buf, len, &actual,
 			   TRIGGER2_BULK_TIMEOUT_MS);
 	if (ret) {
 		dev_err(&trigger2->intf->dev, "OUT%02x command failed: %d\n",
@@ -55,8 +49,8 @@ int trigger2_command_locked(struct trigger2_device *trigger2, u8 endpoint,
 	return 0;
 }
 
-int trigger2_reply_locked(struct trigger2_device *trigger2, void *buf,
-			  size_t len)
+static int trigger2_reply_locked(struct trigger2_device *trigger2, void *buf,
+				 size_t len)
 {
 	struct usb_device *udev = interface_to_usbdev(trigger2->intf);
 	int actual, ret;
@@ -68,7 +62,7 @@ int trigger2_reply_locked(struct trigger2_device *trigger2, void *buf,
 	if (len > TRIGGER2_REPLY_BUF_LEN)
 		return -EMSGSIZE;
 
-	ret = usb_bulk_msg(udev, trigger2->reply_pipe, trigger2->reply_buf,
+	ret = usb_bulk_msg(udev, usb_rcvbulkpipe(udev, 1), trigger2->reply_buf,
 			   len, &actual, TRIGGER2_BULK_TIMEOUT_MS);
 	if (ret) {
 		dev_err(&trigger2->intf->dev, "IN81 reply failed: %d\n", ret);
@@ -124,11 +118,6 @@ int trigger2_edid_read_locked(struct trigger2_device *trigger2, u8 data[512])
 	return trigger2_reply_locked(trigger2, data, TRIGGER2_REPLY_BUF_LEN);
 }
 
-struct trigger2_boot_reg {
-	u16 reg;
-	u8 value;
-};
-
 static const u8 info[] = { TRIGGER2_CMD_BOOT_INFO, 0x00, 0x02, 0x00 };
 static const u8 identity[] = {
 	TRIGGER2_CMD_BOOT_ID, 0x80, 0x00, 0xae, 0x00, 0x00, 0x01, 0x00
@@ -154,7 +143,7 @@ static const u8 bitmap[] = {
 	0x00, 0x00, 0x40, 0x00, 0x40, 0x00, 0x60,
 	0x00, 0x00
 };
-static const struct trigger2_boot_reg reset[] = {
+static const struct trigger2_reg_write reset[] = {
 	{ TRIGGER2_REG_FE57, 0xa0 },
 	{ TRIGGER2_REG_FE57, 0x20 },
 	{ TRIGGER2_REG_FE70, 0x80 },
@@ -163,14 +152,14 @@ static const struct trigger2_boot_reg reset[] = {
 	{ TRIGGER2_REG_FE36, 0x00 },
 	{ TRIGGER2_REG_FC6F, 0x00 },
 };
-static const struct trigger2_boot_reg channel_setup[] = {
+static const struct trigger2_reg_write channel_setup[] = {
 	{ TRIGGER2_REG_FC6A, 0x12 }, { TRIGGER2_REG_FC6B, 0x22 },
 	{ TRIGGER2_REG_FC6A, 0x13 }, { TRIGGER2_REG_FC6B, 0x22 },
 	{ TRIGGER2_REG_FC6A, 0x11 }, { TRIGGER2_REG_FC6B, 0x22 },
 	{ TRIGGER2_REG_FC6A, 0x10 }, { TRIGGER2_REG_FC6B, 0x22 },
 	{ TRIGGER2_REG_FBFF, 0x81 },
 };
-static const struct trigger2_boot_reg pre_bitmap[] = {
+static const struct trigger2_reg_write pre_bitmap[] = {
 	{ TRIGGER2_REG_FCB0, 0x20 },
 	{ TRIGGER2_REG_FC4B, 0x0e },
 	{ TRIGGER2_REG_FBF2, 0x04 },
@@ -181,7 +170,7 @@ static const struct trigger2_boot_reg pre_bitmap[] = {
 	{ TRIGGER2_REG_FCF2, 0x01 },
 	{ TRIGGER2_REG_FC4B, 0x02 },
 };
-static const struct trigger2_boot_reg channel_reset[] = {
+static const struct trigger2_reg_write channel_reset[] = {
 	{ TRIGGER2_REG_CHANNEL_RESET, 0x00 },
 	{ TRIGGER2_REG_CHANNEL_70, 0x00 },
 	{ TRIGGER2_REG_CHANNEL_71, 0x00 },
@@ -194,9 +183,8 @@ static const struct trigger2_boot_reg channel_reset[] = {
 	{ TRIGGER2_REG_FEAA, 0x00 },
 };
 
-static int trigger2_boot_writes_locked(struct trigger2_device *trigger2,
-				       const struct trigger2_boot_reg *writes,
-				       size_t count)
+int trigger2_write_regs_locked(struct trigger2_device *trigger2,
+			       const struct trigger2_reg_write *writes, size_t count)
 {
 	size_t i;
 	int ret;
@@ -209,14 +197,6 @@ static int trigger2_boot_writes_locked(struct trigger2_device *trigger2,
 	}
 
 	return 0;
-}
-
-static int trigger2_boot_read_locked(struct trigger2_device *trigger2, u16 reg)
-{
-	u8 value;
-
-	/* These reads are part of the handshake; observed values vary by boot. */
-	return trigger2_reg_read_locked(trigger2, reg, &value);
 }
 
 static int trigger2_boot_reply_locked(struct trigger2_device *trigger2,
@@ -241,13 +221,16 @@ int trigger2_boot_locked(struct trigger2_device *trigger2)
 	lockdep_assert_held(&trigger2->cmd_lock);
 
 	/* Captured cold re-enumeration, packets 365–509. */
-	ret = trigger2_boot_read_locked(trigger2, TRIGGER2_REG_FC01);
+	ret = trigger2_reg_read_locked(trigger2, TRIGGER2_REG_FC01,
+				      trigger2->reply_buf);
 	if (ret)
 		return ret;
-	ret = trigger2_boot_read_locked(trigger2, TRIGGER2_REG_FEB0);
+	ret = trigger2_reg_read_locked(trigger2, TRIGGER2_REG_FEB0,
+				      trigger2->reply_buf);
 	if (ret)
 		return ret;
-	ret = trigger2_boot_read_locked(trigger2, TRIGGER2_REG_FEB1);
+	ret = trigger2_reg_read_locked(trigger2, TRIGGER2_REG_FEB1,
+				      trigger2->reply_buf);
 	if (ret)
 		return ret;
 	ret = trigger2_reg_write_locked(trigger2, TRIGGER2_REG_FEB0, 0x43);
@@ -256,13 +239,15 @@ int trigger2_boot_locked(struct trigger2_device *trigger2)
 	ret = trigger2_reg_write_locked(trigger2, TRIGGER2_REG_FEB1, 0x03);
 	if (ret)
 		return ret;
-	ret = trigger2_boot_read_locked(trigger2, TRIGGER2_REG_FEB0);
+	ret = trigger2_reg_read_locked(trigger2, TRIGGER2_REG_FEB0,
+				      trigger2->reply_buf);
 	if (ret)
 		return ret;
 	ret = trigger2_reg_write_locked(trigger2, TRIGGER2_REG_FEB0, 0x40);
 	if (ret)
 		return ret;
-	ret = trigger2_boot_read_locked(trigger2, TRIGGER2_REG_FEB1);
+	ret = trigger2_reg_read_locked(trigger2, TRIGGER2_REG_FEB1,
+				      trigger2->reply_buf);
 	if (ret)
 		return ret;
 	ret = trigger2_boot_reply_locked(trigger2, info, sizeof(info));
@@ -275,7 +260,7 @@ int trigger2_boot_locked(struct trigger2_device *trigger2)
 	if (ret)
 		return ret;
 
-	ret = trigger2_boot_writes_locked(trigger2, reset, ARRAY_SIZE(reset));
+	ret = trigger2_write_regs_locked(trigger2, reset, ARRAY_SIZE(reset));
 	if (ret)
 		return ret;
 	ret = trigger2_command_locked(trigger2, 3, config_a, sizeof(config_a));
@@ -304,7 +289,7 @@ int trigger2_boot_locked(struct trigger2_device *trigger2)
 	ret = trigger2_command_locked(trigger2, 3, pairs, sizeof(pairs));
 	if (ret)
 		return ret;
-	ret = trigger2_boot_writes_locked(trigger2, channel_setup,
+	ret = trigger2_write_regs_locked(trigger2, channel_setup,
 					  ARRAY_SIZE(channel_setup));
 	if (ret)
 		return ret;
@@ -319,10 +304,11 @@ int trigger2_boot_locked(struct trigger2_device *trigger2)
 	ret = trigger2_reg_write_locked(trigger2, TRIGGER2_REG_FC6F, 0x00);
 	if (ret)
 		return ret;
-	ret = trigger2_boot_read_locked(trigger2, TRIGGER2_REG_FCA3);
+	ret = trigger2_reg_read_locked(trigger2, TRIGGER2_REG_FCA3,
+				      trigger2->reply_buf);
 	if (ret)
 		return ret;
-	ret = trigger2_boot_writes_locked(trigger2, pre_bitmap,
+	ret = trigger2_write_regs_locked(trigger2, pre_bitmap,
 					  ARRAY_SIZE(pre_bitmap));
 	if (ret)
 		return ret;
@@ -339,7 +325,7 @@ int trigger2_boot_locked(struct trigger2_device *trigger2)
 				      sizeof(board_pairs));
 	if (ret)
 		return ret;
-	ret = trigger2_boot_writes_locked(trigger2, channel_reset,
+	ret = trigger2_write_regs_locked(trigger2, channel_reset,
 					  ARRAY_SIZE(channel_reset));
 	if (ret)
 		return ret;
@@ -348,10 +334,12 @@ int trigger2_boot_locked(struct trigger2_device *trigger2)
 	ret = trigger2_edid_read_locked(trigger2, trigger2->reply_buf);
 	if (ret)
 		return ret;
-	ret = trigger2_boot_read_locked(trigger2, TRIGGER2_REG_FEB0);
+	ret = trigger2_reg_read_locked(trigger2, TRIGGER2_REG_FEB0,
+				      trigger2->reply_buf);
 	if (ret)
 		return ret;
-	ret = trigger2_boot_read_locked(trigger2, TRIGGER2_REG_FEB1);
+	ret = trigger2_reg_read_locked(trigger2, TRIGGER2_REG_FEB1,
+				      trigger2->reply_buf);
 	if (ret)
 		return ret;
 	ret = trigger2_reg_write_locked(trigger2, TRIGGER2_REG_FEB0, 0x40);

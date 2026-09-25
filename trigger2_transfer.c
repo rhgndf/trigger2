@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+#include <linux/device.h>
 #include <linux/jiffies.h>
 #include <linux/limits.h>
 #include <linux/overflow.h>
@@ -34,9 +35,7 @@ void trigger2_stop_io(struct trigger2_device *trigger2)
 
 static void trigger2_bulk_complete(struct urb *urb)
 {
-	struct trigger2_bulk_chunk *chunk = urb->context;
-
-	complete(&chunk->complete);
+	complete(urb->context);
 }
 
 static int trigger2_wait_chunk(struct trigger2_bulk_chunk *chunk)
@@ -51,10 +50,10 @@ static int trigger2_wait_chunk(struct trigger2_bulk_chunk *chunk)
 	return 0;
 }
 
-static int trigger2_send_bulk(struct trigger2_transfer *transfer,
+static int trigger2_send_bulk(struct trigger2_device *trigger2,
 			      const u8 *data, size_t len)
 {
-	unsigned int submitted = 0, completed = 0;
+	unsigned int submitted = 0, completed = 0, i;
 	struct trigger2_bulk_chunk *chunk;
 	size_t offset = 0, count;
 	int ret;
@@ -63,33 +62,30 @@ static int trigger2_send_bulk(struct trigger2_transfer *transfer,
 	/* NULL data produces the zero-filled mode bitmap without staging it. */
 	while (offset < len) {
 		if (submitted - completed == TRIGGER2_BULK_URBS) {
-			ret = trigger2_wait_chunk(&transfer->chunks[
+			ret = trigger2_wait_chunk(&trigger2->chunks[
 						completed % TRIGGER2_BULK_URBS]);
 			if (ret)
 				goto cancel;
 			completed++;
 		}
 
-		chunk = &transfer->chunks[submitted % TRIGGER2_BULK_URBS];
+		chunk = &trigger2->chunks[submitted % TRIGGER2_BULK_URBS];
 		count = min_t(size_t, len - offset, TRIGGER2_BULK_CHUNK_SIZE);
 		if (data)
-			memcpy(chunk->data, data + offset, count);
+			memcpy(chunk->urb->transfer_buffer, data + offset, count);
 		else
-			memset(chunk->data, 0, count);
+			memset(chunk->urb->transfer_buffer, 0, count);
 		reinit_completion(&chunk->complete);
 		chunk->urb->transfer_buffer_length = count;
-		usb_anchor_urb(chunk->urb, &transfer->submitted);
 		ret = usb_submit_urb(chunk->urb, GFP_KERNEL);
-		if (ret) {
-			usb_unanchor_urb(chunk->urb);
+		if (ret)
 			goto cancel;
-		}
 		submitted++;
 		offset += count;
 	}
 
 	while (completed < submitted) {
-		ret = trigger2_wait_chunk(&transfer->chunks[
+		ret = trigger2_wait_chunk(&trigger2->chunks[
 					completed % TRIGGER2_BULK_URBS]);
 		if (ret)
 			goto cancel;
@@ -98,7 +94,8 @@ static int trigger2_send_bulk(struct trigger2_transfer *transfer,
 	return 0;
 
 cancel:
-	usb_kill_anchored_urbs(&transfer->submitted);
+	for (i = 0; i < TRIGGER2_BULK_URBS; i++)
+		usb_kill_urb(trigger2->chunks[i].urb);
 	return ret;
 }
 
@@ -124,7 +121,7 @@ static void trigger2_transfer_work(struct work_struct *work)
 	if (!ret && actual != TRIGGER2_FRAME_HEADER_LEN)
 		ret = -EIO;
 	if (!ret)
-		ret = trigger2_send_bulk(transfer, transfer->buf.data,
+		ret = trigger2_send_bulk(trigger2, transfer->buf.data,
 					 transfer->frame_len);
 	if (ret)
 		drm_err_ratelimited(&trigger2->drm, "USB frame failed: %d\n", ret);
@@ -136,8 +133,6 @@ complete:
 
 void trigger2_free_bulk_buffer(struct trigger2_transfer_buf *buf)
 {
-	if (!buf->data)
-		return;
 	vfree(buf->data);
 	buf->data = NULL;
 	buf->len = 0;
@@ -150,34 +145,6 @@ int trigger2_alloc_bulk_buffer(struct trigger2_transfer_buf *buf, size_t len)
 	if (!buf->data)
 		return -ENOMEM;
 	buf->len = len;
-	return 0;
-}
-
-static int trigger2_init_transfer(struct trigger2_device *trigger2,
-				  struct trigger2_transfer *transfer)
-{
-	struct usb_device *udev = interface_to_usbdev(trigger2->intf);
-	struct trigger2_bulk_chunk *chunk;
-	unsigned int i;
-
-	init_completion(&transfer->frame_complete);
-	complete(&transfer->frame_complete);
-	INIT_WORK(&transfer->transfer_work, trigger2_transfer_work);
-	transfer->trigger2 = trigger2;
-
-	for (i = 0; i < TRIGGER2_BULK_URBS; i++) {
-		chunk = &transfer->chunks[i];
-		chunk->data = kmalloc(TRIGGER2_BULK_CHUNK_SIZE, GFP_KERNEL);
-		if (!chunk->data)
-			return -ENOMEM;
-		chunk->urb = usb_alloc_urb(0, GFP_KERNEL);
-		if (!chunk->urb)
-			return -ENOMEM;
-		init_completion(&chunk->complete);
-		usb_fill_bulk_urb(chunk->urb, udev, trigger2->bulk_pipe,
-				  chunk->data, TRIGGER2_BULK_CHUNK_SIZE,
-				  trigger2_bulk_complete, chunk);
-	}
 	return 0;
 }
 
@@ -220,7 +187,7 @@ int trigger2_transfer_mode_init(struct trigger2_device *trigger2,
 	if (actual != 21)
 		return -EIO;
 
-	ret = trigger2_send_bulk(transfer, NULL, bitmap_len);
+	ret = trigger2_send_bulk(trigger2, NULL, bitmap_len);
 	if (ret)
 		drm_err(&trigger2->drm, "USB mode bitmap failed: %d\n", ret);
 	return ret;
@@ -239,12 +206,8 @@ static void trigger2_frame_header(u8 *header, u32 addr, u16 width, u16 height,
 	put_unaligned_le16(height, header + 16);
 	header[19] = header[21] = 0x40;
 	put_unaligned_le32(frame_end, header + 23);
-	header[27] = raw_len;
-	header[28] = raw_len >> 8;
-	header[29] = raw_len >> 16;
-	header[30] = encoded_len;
-	header[31] = encoded_len >> 8;
-	header[32] = encoded_len >> 16;
+	put_unaligned_le24(raw_len, header + 27);
+	put_unaligned_le24(encoded_len, header + 30);
 	header[33] = 0x30;
 	header[34] = 0x05;
 	header[35] = 0x28;
@@ -257,7 +220,7 @@ int trigger2_transfer_blank_frame(struct trigger2_device *trigger2,
 	struct usb_device *udev = interface_to_usbdev(trigger2->intf);
 	u8 *out = transfer->buf.data;
 	size_t pixels = (size_t)width * height, pos, written = 0;
-	size_t n, rem, run;
+	size_t rem, run;
 	unsigned int c;
 	int actual, ret;
 
@@ -265,10 +228,9 @@ int trigger2_transfer_blank_frame(struct trigger2_device *trigger2,
 	    3 * pixels > transfer->buf.len || 3 * pixels > 0xffffff)
 		return -EINVAL;
 
-	for (pos = 0; pos < pixels; pos += n) {
-		n = min_t(size_t, TRIGGER2_RGB_BLOCK_PIXELS, pixels - pos);
+	for (pos = 0; pos < pixels; pos += TRIGGER2_RGB_BLOCK_PIXELS) {
 		for (c = 0; c < 3; c++)
-			for (rem = n; rem; rem -= run) {
+			for (rem = TRIGGER2_RGB_BLOCK_PIXELS; rem; rem -= run) {
 				run = min_t(size_t, rem, 251);
 				out[written++] = 0x30;
 				out[written++] = run - 1;
@@ -285,7 +247,7 @@ int trigger2_transfer_blank_frame(struct trigger2_device *trigger2,
 	if (actual != TRIGGER2_FRAME_HEADER_LEN)
 		return -EIO;
 
-	return trigger2_send_bulk(transfer, transfer->buf.data, written);
+	return trigger2_send_bulk(trigger2, transfer->buf.data, written);
 }
 
 static void trigger2_clear_rect(struct drm_rect *rect)
@@ -403,7 +365,7 @@ static size_t trigger2_encode_frame(struct trigger2_transfer *transfer,
 }
 
 void trigger2_plane_atomic_update(struct drm_plane *plane,
-				  trigger2_atomic_state *atomic_state)
+				  struct drm_atomic_commit *atomic_state)
 {
 	struct drm_plane_state *old_state =
 		drm_atomic_get_old_plane_state(atomic_state, plane);
@@ -536,39 +498,67 @@ exit:
 	drm_dev_exit(idx);
 }
 
-void trigger2_transfer_fini(struct trigger2_device *trigger2)
+static void trigger2_transfer_fini(void *data)
 {
-	unsigned int i, j;
+	struct trigger2_device *trigger2 = data;
+	unsigned int i;
 
+	trigger2_stop_io(trigger2);
+	for (i = 0; i < TRIGGER2_BULK_URBS; i++) {
+		usb_kill_urb(trigger2->chunks[i].urb);
+		usb_free_urb(trigger2->chunks[i].urb);
+	}
 	for (i = 0; i < TRIGGER2_NUM_TRANSFERS; i++) {
-		struct trigger2_transfer *transfer = &trigger2->transfers[i];
-
-		usb_kill_anchored_urbs(&transfer->submitted);
-		for (j = 0; j < TRIGGER2_BULK_URBS; j++) {
-			struct trigger2_bulk_chunk *chunk = &transfer->chunks[j];
-
-			usb_free_urb(chunk->urb);
-			kfree(chunk->data);
-			chunk->urb = NULL;
-			chunk->data = NULL;
-		}
+		kfree(trigger2->transfers[i].header);
+		trigger2_free_bulk_buffer(&trigger2->transfers[i].buf);
 	}
 }
 
 int trigger2_transfer_init(struct trigger2_device *trigger2)
 {
-	int i, ret;
+	struct usb_device *udev = interface_to_usbdev(trigger2->intf);
+	struct trigger2_bulk_chunk *chunk;
+	unsigned int i;
+	int ret;
 
 	trigger2_clear_rect(&trigger2->pending_rect);
 	atomic_set(&trigger2->io_generation, 0);
-	for (i = 0; i < TRIGGER2_NUM_TRANSFERS; i++)
-		init_usb_anchor(&trigger2->transfers[i].submitted);
 	for (i = 0; i < TRIGGER2_NUM_TRANSFERS; i++) {
-		ret = trigger2_init_transfer(trigger2, &trigger2->transfers[i]);
-		if (ret) {
-			trigger2_transfer_fini(trigger2);
-			return ret;
-		}
+		struct trigger2_transfer *transfer = &trigger2->transfers[i];
+
+		init_completion(&transfer->frame_complete);
+		complete(&transfer->frame_complete);
+		INIT_WORK(&transfer->transfer_work, trigger2_transfer_work);
+		transfer->trigger2 = trigger2;
+	}
+
+	ret = devm_add_action_or_reset(&trigger2->intf->dev,
+				       trigger2_transfer_fini, trigger2);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < TRIGGER2_NUM_TRANSFERS; i++) {
+		trigger2->transfers[i].header =
+			kmalloc(TRIGGER2_FRAME_HEADER_LEN, GFP_KERNEL);
+		if (!trigger2->transfers[i].header)
+			return -ENOMEM;
+	}
+
+	/* Ordered frame work and drained mode changes share one USB pool. */
+	for (i = 0; i < TRIGGER2_BULK_URBS; i++) {
+		chunk = &trigger2->chunks[i];
+		chunk->urb = usb_alloc_urb(0, GFP_KERNEL);
+		if (!chunk->urb)
+			return -ENOMEM;
+		chunk->urb->transfer_flags |= URB_FREE_BUFFER;
+		chunk->urb->transfer_buffer =
+			kmalloc(TRIGGER2_BULK_CHUNK_SIZE, GFP_KERNEL);
+		if (!chunk->urb->transfer_buffer)
+			return -ENOMEM;
+		init_completion(&chunk->complete);
+		usb_fill_bulk_urb(chunk->urb, udev, trigger2->bulk_pipe,
+				  chunk->urb->transfer_buffer, TRIGGER2_BULK_CHUNK_SIZE,
+				  trigger2_bulk_complete, &chunk->complete);
 	}
 	return 0;
 }

@@ -8,17 +8,16 @@
 #include <linux/overflow.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/version.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_atomic_state_helper.h>
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_drv.h>
-#include <drm/drm_framebuffer.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
-#include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_modeset_helper.h>
 #include <drm/drm_modeset_helper_vtables.h>
@@ -32,6 +31,19 @@ static const struct drm_mode_config_funcs trigger2_mode_config_funcs = {
 	.atomic_check = drm_atomic_helper_check,
 	.atomic_commit = drm_atomic_helper_commit,
 };
+
+struct trigger2_crtc_state {
+	struct drm_crtc_state base;
+
+	/* Allocated by atomic_check and installed by atomic_commit_tail. */
+	struct trigger2_transfer_buf bufs[TRIGGER2_NUM_TRANSFERS];
+};
+
+static inline struct trigger2_crtc_state *
+to_trigger2_crtc_state(struct drm_crtc_state *state)
+{
+	return container_of(state, struct trigger2_crtc_state, base);
+}
 
 struct trigger2_clock {
 	u8 f3;
@@ -93,7 +105,7 @@ static u32 trigger2_calculate_clock(struct trigger2_clock *clock, u32 target)
  * Swap the new buffers in here because atomic_enable is not called for
  * a CRTC that is enabled but inactive.
  */
-static void trigger2_atomic_commit_tail(trigger2_atomic_state *state)
+static void trigger2_atomic_commit_tail(struct drm_atomic_commit *state)
 {
 	struct trigger2_device *trigger2 = to_trigger2(state->dev);
 	struct drm_crtc_state *crtc_state;
@@ -113,9 +125,8 @@ static void trigger2_atomic_commit_tail(trigger2_atomic_state *state)
 
 	trigger2_stop_io(trigger2);
 	for (i = 0; i < TRIGGER2_NUM_TRANSFERS; i++) {
-		trigger2_free_bulk_buffer(&trigger2->transfers[i].buf);
-		trigger2->transfers[i].buf = tstate->bufs[i];
-		memset(&tstate->bufs[i], 0, sizeof(tstate->bufs[i]));
+		swap(trigger2->transfers[i].buf, tstate->bufs[i]);
+		trigger2_free_bulk_buffer(&tstate->bufs[i]);
 	}
 
 	drm_dev_exit(idx);
@@ -129,7 +140,17 @@ trigger2_mode_config_helper_funcs = {
 };
 
 static void trigger2_crtc_destroy_state(struct drm_crtc *crtc,
-					struct drm_crtc_state *state);
+					struct drm_crtc_state *state)
+{
+	struct trigger2_crtc_state *tstate = to_trigger2_crtc_state(state);
+	int i;
+
+	for (i = 0; i < TRIGGER2_NUM_TRANSFERS; i++)
+		trigger2_free_bulk_buffer(&tstate->bufs[i]);
+
+	__drm_atomic_helper_crtc_destroy_state(state);
+	kfree(tstate);
+}
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 3, 0)
 static struct drm_crtc_state *
@@ -175,19 +196,6 @@ trigger2_crtc_duplicate_state(struct drm_crtc *crtc)
 	return &tstate->base;
 }
 
-static void trigger2_crtc_destroy_state(struct drm_crtc *crtc,
-					struct drm_crtc_state *state)
-{
-	struct trigger2_crtc_state *tstate = to_trigger2_crtc_state(state);
-	int i;
-
-	for (i = 0; i < TRIGGER2_NUM_TRANSFERS; i++)
-		trigger2_free_bulk_buffer(&tstate->bufs[i]);
-
-	__drm_atomic_helper_crtc_destroy_state(state);
-	kfree(tstate);
-}
-
 static size_t trigger2_mode_buf_len(const struct drm_display_mode *mode)
 {
 	return array3_size(mode->hdisplay,
@@ -195,7 +203,7 @@ static size_t trigger2_mode_buf_len(const struct drm_display_mode *mode)
 }
 
 static int trigger2_crtc_atomic_check(struct drm_crtc *crtc,
-				      trigger2_atomic_state *state)
+				      struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *old_crtc_state =
 		drm_atomic_get_old_crtc_state(state, crtc);
@@ -228,27 +236,6 @@ static int trigger2_crtc_atomic_check(struct drm_crtc *crtc,
 			return ret;
 	}
 
-	return 0;
-}
-
-struct trigger2_reg_write {
-	u16 reg;
-	u8 value;
-};
-
-static int trigger2_write_regs_locked(struct trigger2_device *trigger2,
-				      const struct trigger2_reg_write *writes,
-				      size_t count)
-{
-	size_t i;
-	int ret;
-
-	for (i = 0; i < count; i++) {
-		ret = trigger2_reg_write_locked(trigger2, writes[i].reg,
-						writes[i].value);
-		if (ret)
-			return ret;
-	}
 	return 0;
 }
 
@@ -600,7 +587,7 @@ static int trigger2_program_mode_locked(struct trigger2_device *trigger2,
 }
 
 static void trigger2_crtc_atomic_enable(struct drm_crtc *crtc,
-					trigger2_atomic_state *state)
+					struct drm_atomic_commit *state)
 {
 	struct trigger2_device *trigger2 = to_trigger2(crtc->dev);
 	struct drm_crtc_state *crtc_state =
@@ -622,7 +609,7 @@ static void trigger2_crtc_atomic_enable(struct drm_crtc *crtc,
 }
 
 static void trigger2_crtc_atomic_disable(struct drm_crtc *crtc,
-					 trigger2_atomic_state *state)
+					 struct drm_atomic_commit *state)
 {
 	struct trigger2_device *trigger2 = to_trigger2(crtc->dev);
 	int idx, ret;
@@ -671,14 +658,14 @@ trigger2_crtc_mode_valid(struct drm_crtc *crtc,
 	if (!mode->clock || mode->clock > 200000)
 		return MODE_CLOCK_RANGE;
 	error = trigger2_calculate_clock(&clock, mode->clock);
-	if ((u64)error * 1000000 > (u64)mode->clock * 10000)
+	if ((u64)error * 100 > mode->clock)
 		return MODE_CLOCK_RANGE;
 
 	return MODE_OK;
 }
 
 static int trigger2_plane_atomic_check(struct drm_plane *plane,
-				       trigger2_atomic_state *state)
+				       struct drm_atomic_commit *state)
 {
 	struct drm_plane_state *new_plane_state =
 		drm_atomic_get_new_plane_state(state, plane);
@@ -736,7 +723,6 @@ static const struct drm_encoder_funcs trigger2_encoder_funcs = {
 static const u32 trigger2_plane_formats[] = {
 	DRM_FORMAT_XRGB8888,
 };
-
 
 int trigger2_modeset_init(struct trigger2_device *trigger2)
 {

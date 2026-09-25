@@ -56,13 +56,15 @@ static const struct drm_driver trigger2_drm_driver = {
 static int trigger2_usb_probe(struct usb_interface *interface,
 			      const struct usb_device_id *id)
 {
+	static const u8 endpoints[] = { 0x02, 0x03, 0x04, 0x81, 0 };
 	struct trigger2_device *trigger2;
 	struct drm_device *dev;
 	struct device *dma_dev;
 	struct usb_device *udev = interface_to_usbdev(interface);
-	struct usb_host_interface *alt = interface->cur_altsetting;
-	struct usb_endpoint_descriptor *ep;
-	int ret, i;
+	int ret;
+
+	if (!usb_check_bulk_endpoints(interface, endpoints))
+		return -ENODEV;
 
 	trigger2 = devm_drm_dev_alloc(&interface->dev, &trigger2_drm_driver,
 				      struct trigger2_device, drm);
@@ -72,28 +74,7 @@ static int trigger2_usb_probe(struct usb_interface *interface,
 	trigger2->intf = interface;
 	mutex_init(&trigger2->cmd_lock);
 
-	for (i = 0; i < alt->desc.bNumEndpoints; i++) {
-		ep = &alt->endpoint[i].desc;
-		if (usb_endpoint_is_bulk_out(ep)) {
-			switch (ep->bEndpointAddress) {
-			case 0x02:
-				trigger2->bulk_pipe = usb_sndbulkpipe(udev, 2);
-				break;
-			case 0x03:
-				trigger2->cmd_pipe = usb_sndbulkpipe(udev, 3);
-				break;
-			case 0x04:
-				trigger2->aux_pipe = usb_sndbulkpipe(udev, 4);
-				break;
-			}
-		} else if (usb_endpoint_is_bulk_in(ep) &&
-			   ep->bEndpointAddress == 0x81) {
-			trigger2->reply_pipe = usb_rcvbulkpipe(udev, 1);
-		}
-	}
-	if (!trigger2->bulk_pipe || !trigger2->cmd_pipe ||
-	    !trigger2->aux_pipe || !trigger2->reply_pipe)
-		return -ENODEV;
+	trigger2->bulk_pipe = usb_sndbulkpipe(udev, 2);
 
 	trigger2->cmd_buf = devm_kmalloc(&interface->dev,
 					 TRIGGER2_CMD_BUF_LEN, GFP_KERNEL);
@@ -108,14 +89,6 @@ static int trigger2_usb_probe(struct usb_interface *interface,
 	if (ret)
 		return ret;
 
-	for (i = 0; i < TRIGGER2_NUM_TRANSFERS; i++) {
-		trigger2->transfers[i].header =
-			devm_kmalloc(&interface->dev, TRIGGER2_FRAME_HEADER_LEN,
-				     GFP_KERNEL);
-		if (!trigger2->transfers[i].header)
-			return -ENOMEM;
-	}
-
 	dev = &trigger2->drm;
 
 	dma_dev = usb_intf_get_dma_device(interface);
@@ -127,41 +100,30 @@ static int trigger2_usb_probe(struct usb_interface *interface,
 			 "buffer sharing not supported"); /* not an error */
 	}
 
-	ret = trigger2_modeset_init(trigger2);
-	if (ret)
-		return ret;
+	trigger2->transfer_wq =
+		devm_alloc_ordered_workqueue(&interface->dev, DRIVER_NAME, 0);
+	if (!trigger2->transfer_wq)
+		return -ENOMEM;
 
 	ret = trigger2_transfer_init(trigger2);
 	if (ret)
 		return ret;
 
-	trigger2->transfer_wq = alloc_ordered_workqueue(DRIVER_NAME, 0);
-	if (!trigger2->transfer_wq) {
-		ret = -ENOMEM;
-		goto err_transfer_fini;
-	}
+	ret = trigger2_modeset_init(trigger2);
+	if (ret)
+		return ret;
 
 	drm_mode_config_reset(dev);
 
-	usb_set_intfdata(interface, trigger2);
-
-	drm_kms_helper_poll_init(dev);
-
 	ret = drm_dev_register(dev, 0);
 	if (ret)
-		goto err_poll_fini;
+		return ret;
 
+	usb_set_intfdata(interface, trigger2);
+	drm_kms_helper_poll_init(dev);
 	drm_client_setup(dev, NULL);
 
 	return 0;
-
-err_poll_fini:
-	drm_kms_helper_poll_fini(dev);
-	usb_set_intfdata(interface, NULL);
-	destroy_workqueue(trigger2->transfer_wq);
-err_transfer_fini:
-	trigger2_transfer_fini(trigger2);
-	return ret;
 }
 
 static void trigger2_usb_disconnect(struct usb_interface *interface)
@@ -172,15 +134,73 @@ static void trigger2_usb_disconnect(struct usb_interface *interface)
 	drm_kms_helper_poll_fini(dev);
 	drm_dev_unplug(dev);
 	drm_atomic_helper_shutdown(dev);
-	trigger2_stop_io(trigger2);
-	destroy_workqueue(trigger2->transfer_wq);
-	trigger2_transfer_fini(trigger2);
-	trigger2_free_bulk_buffer(&trigger2->transfers[0].buf);
-	trigger2_free_bulk_buffer(&trigger2->transfers[1].buf);
 }
 
 static const struct usb_device_id id_table[] = {
 	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5200, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5201, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5202, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5203, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5204, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5205, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5206, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5207, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5208, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5209, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x520a, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x520b, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x520c, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x520d, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x520e, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x520f, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5300, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5301, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5302, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5303, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5304, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5305, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5306, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5307, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5308, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5309, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x530a, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x530b, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x530c, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x530d, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x530e, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x530f, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5400, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5401, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5402, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5403, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5404, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5405, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5406, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5407, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5408, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5409, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x540a, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x540b, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x540c, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x540d, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x540e, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x540f, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5500, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5501, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5502, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5503, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5504, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5505, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5506, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5507, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5508, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x5509, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x550a, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x550b, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x550c, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x550d, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x550e, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x0711, 0x550f, 0) },
 	{},
 };
 MODULE_DEVICE_TABLE(usb, id_table);
