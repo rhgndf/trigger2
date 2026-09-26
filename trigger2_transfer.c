@@ -51,12 +51,23 @@ static int trigger2_wait_chunk(struct trigger2_bulk_chunk *chunk)
 }
 
 static int trigger2_send_bulk(struct trigger2_device *trigger2,
+			      const u8 *header, size_t header_len,
 			      const u8 *data, size_t len)
 {
 	unsigned int submitted = 0, completed = 0, i;
 	struct trigger2_bulk_chunk *chunk;
 	size_t offset = 0, count;
 	int ret;
+
+	/* The frame descriptor rides the ordered chunk pool before payloads. */
+	chunk = &trigger2->chunks[0];
+	memcpy(chunk->urb->transfer_buffer, header, header_len);
+	reinit_completion(&chunk->complete);
+	chunk->urb->transfer_buffer_length = header_len;
+	ret = usb_submit_urb(chunk->urb, GFP_KERNEL);
+	if (ret)
+		goto cancel;
+	submitted = 1;
 
 	/* The device expects EP02 payloads in requests of at most 20,480 bytes. */
 	/* NULL data produces the zero-filled mode bitmap without staging it. */
@@ -104,8 +115,7 @@ static void trigger2_transfer_work(struct work_struct *work)
 	struct trigger2_transfer *transfer =
 		container_of(work, struct trigger2_transfer, transfer_work);
 	struct trigger2_device *trigger2 = transfer->trigger2;
-	struct usb_device *udev = interface_to_usbdev(trigger2->intf);
-	int idx, ret, actual;
+	int idx, ret;
 
 	if (!drm_dev_enter(&trigger2->drm, &idx))
 		goto complete;
@@ -114,15 +124,9 @@ static void trigger2_transfer_work(struct work_struct *work)
 	    transfer->generation != atomic_read(&trigger2->io_generation))
 		goto exit;
 
-	/* The ordered workqueue keeps frame descriptors ahead of their payloads. */
-	ret = usb_bulk_msg(udev, trigger2->bulk_pipe, transfer->header,
-			   TRIGGER2_FRAME_HEADER_LEN, &actual,
-			   TRIGGER2_BULK_TIMEOUT_MS);
-	if (!ret && actual != TRIGGER2_FRAME_HEADER_LEN)
-		ret = -EIO;
-	if (!ret)
-		ret = trigger2_send_bulk(trigger2, transfer->buf.data,
-					 transfer->frame_len);
+	ret = trigger2_send_bulk(trigger2, transfer->header,
+				 TRIGGER2_FRAME_HEADER_LEN,
+				 transfer->buf.data, transfer->frame_len);
 	if (ret)
 		drm_err_ratelimited(&trigger2->drm, "USB frame failed: %d\n", ret);
 exit:
@@ -152,7 +156,6 @@ int trigger2_transfer_mode_init(struct trigger2_device *trigger2,
 				const struct drm_display_mode *mode)
 {
 	struct trigger2_transfer *transfer = &trigger2->transfers[0];
-	struct usb_device *udev = interface_to_usbdev(trigger2->intf);
 	u32 width = mode->hdisplay, height = mode->vdisplay;
 	u32 padded_height = trigger2_padded_height(width, height);
 	u64 pixels = (u64)width * height;
@@ -160,7 +163,7 @@ int trigger2_transfer_mode_init(struct trigger2_device *trigger2,
 		    9 * (u64)width * padded_height;
 	size_t bitmap_len = pixels / 8;
 	u8 *setup = transfer->header;
-	int actual, ret;
+	int ret;
 
 	/* Quarter dimensions and bitmap bytes must be exact on the wire. */
 	if (!width || !height || ((width | height) & 3) ||
@@ -180,14 +183,7 @@ int trigger2_transfer_mode_init(struct trigger2_device *trigger2,
 	setup[14] = setup[16] = 0x10;
 	put_unaligned_le32(32 * pixels + 4, setup + 17);
 
-	ret = usb_bulk_msg(udev, trigger2->bulk_pipe, setup, 21,
-			   &actual, TRIGGER2_BULK_TIMEOUT_MS);
-	if (ret)
-		return ret;
-	if (actual != 21)
-		return -EIO;
-
-	ret = trigger2_send_bulk(trigger2, NULL, bitmap_len);
+	ret = trigger2_send_bulk(trigger2, setup, 21, NULL, bitmap_len);
 	if (ret)
 		drm_err(&trigger2->drm, "USB mode bitmap failed: %d\n", ret);
 	return ret;
@@ -217,12 +213,10 @@ int trigger2_transfer_blank_frame(struct trigger2_device *trigger2,
 				  u16 width, u16 height)
 {
 	struct trigger2_transfer *transfer = &trigger2->transfers[0];
-	struct usb_device *udev = interface_to_usbdev(trigger2->intf);
 	u8 *out = transfer->buf.data;
 	size_t pixels = (size_t)width * height, pos, written = 0;
 	size_t rem, run;
 	unsigned int c;
-	int actual, ret;
 
 	if ((pixels & (TRIGGER2_RGB_BLOCK_PIXELS - 1)) ||
 	    3 * pixels > transfer->buf.len || 3 * pixels > 0xffffff)
@@ -239,15 +233,9 @@ int trigger2_transfer_blank_frame(struct trigger2_device *trigger2,
 	}
 	trigger2_frame_header(transfer->header, trigger2->frame_base, width,
 			      height, trigger2->frame_end, 3 * pixels, written);
-	ret = usb_bulk_msg(udev, trigger2->bulk_pipe, transfer->header,
-			   TRIGGER2_FRAME_HEADER_LEN, &actual,
-			   TRIGGER2_BULK_TIMEOUT_MS);
-	if (ret)
-		return ret;
-	if (actual != TRIGGER2_FRAME_HEADER_LEN)
-		return -EIO;
-
-	return trigger2_send_bulk(trigger2, transfer->buf.data, written);
+	return trigger2_send_bulk(trigger2, transfer->header,
+				  TRIGGER2_FRAME_HEADER_LEN,
+				  transfer->buf.data, written);
 }
 
 static void trigger2_clear_rect(struct drm_rect *rect)
