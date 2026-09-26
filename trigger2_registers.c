@@ -102,7 +102,8 @@ int trigger2_reg_write_locked(struct trigger2_device *trigger2, u16 reg,
 	return trigger2_command_locked(trigger2, 3, cmd, sizeof(cmd));
 }
 
-int trigger2_edid_read_locked(struct trigger2_device *trigger2, u8 data[512])
+int trigger2_edid_read_locked(struct trigger2_device *trigger2,
+			      u8 data[TRIGGER2_EDID_LEN])
 {
 	const u8 cmd[] = { TRIGGER2_CMD_EDID, 0x80, 0x00, 0xa0,
 			   0x00, 0x80, 0x00, 0x00 };

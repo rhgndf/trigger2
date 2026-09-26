@@ -28,6 +28,7 @@
 #define TRIGGER2_NUM_TRANSFERS	2
 #define TRIGGER2_CMD_BUF_LEN	769
 #define TRIGGER2_REPLY_BUF_LEN	512
+#define TRIGGER2_EDID_LEN	512
 #define TRIGGER2_FRAME_HEADER_LEN	36
 #define TRIGGER2_BULK_TIMEOUT_MS	5000
 #define TRIGGER2_BULK_CHUNK_SIZE	(20 * 1024)
@@ -73,6 +74,8 @@ struct trigger2_device {
 	struct drm_crtc crtc;
 	struct drm_encoder encoder;
 
+	u8 edid[TRIGGER2_EDID_LEN];
+
 	int current_transfer;
 	struct drm_rect pending_rect;
 	struct workqueue_struct *transfer_wq;
@@ -115,7 +118,8 @@ int trigger2_reg_write_locked(struct trigger2_device *trigger2,
 			      u16 reg, u8 value);
 int trigger2_write_regs_locked(struct trigger2_device *trigger2,
 			       const struct trigger2_reg_write *writes, size_t count);
-int trigger2_edid_read_locked(struct trigger2_device *trigger2, u8 data[512]);
+int trigger2_edid_read_locked(struct trigger2_device *trigger2,
+			      u8 data[TRIGGER2_EDID_LEN]);
 int trigger2_boot_locked(struct trigger2_device *trigger2);
 
 int trigger2_alloc_bulk_buffer(struct trigger2_transfer_buf *buf, size_t len);

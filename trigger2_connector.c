@@ -23,7 +23,7 @@ static bool trigger2_edid_checksum_ok(const u8 *block)
 }
 
 static int trigger2_fetch_edid(struct trigger2_device *trigger2,
-				u8 reply[TRIGGER2_REPLY_BUF_LEN])
+				u8 reply[TRIGGER2_EDID_LEN])
 {
 	int idx, ret;
 
@@ -37,53 +37,30 @@ static int trigger2_fetch_edid(struct trigger2_device *trigger2,
 	return ret;
 }
 
-struct trigger2_edid_read {
-	struct trigger2_device *trigger2;
-	bool fetched;
-	u8 reply[TRIGGER2_REPLY_BUF_LEN];
-};
-
 static int trigger2_read_edid(void *data, u8 *buf, unsigned int block,
 			      size_t len)
 {
-	struct trigger2_edid_read *ctx = data;
-	int ret;
+	struct trigger2_device *trigger2 = data;
+	const u8 *edid = trigger2->edid;
 
 	if (len != EDID_LENGTH ||
-	    block >= ARRAY_SIZE(ctx->reply) / EDID_LENGTH)
+	    block >= ARRAY_SIZE(trigger2->edid) / EDID_LENGTH)
 		return -EINVAL;
 
-	if (!ctx->fetched) {
-		ret = trigger2_fetch_edid(ctx->trigger2, ctx->reply);
-		if (ret)
-			return ret;
-		/* IN81 returns 512 bytes even without a usable EDID. */
-		if (drm_edid_header_is_valid(ctx->reply) != 8 ||
-		    !trigger2_edid_checksum_ok(ctx->reply))
-			return -EBADMSG;
-		if (ctx->reply[126] >= sizeof(ctx->reply) / EDID_LENGTH)
-			return -EOVERFLOW;
-		ctx->fetched = true;
-	}
-	if (block > ctx->reply[126])
-		return -EINVAL;
-	if (block && !trigger2_edid_checksum_ok(ctx->reply +
-						 block * EDID_LENGTH))
-		return -EBADMSG;
+	if (block > edid[126])
+		return -EOVERFLOW;
 
-	memcpy(buf, ctx->reply + block * EDID_LENGTH, EDID_LENGTH);
+	memcpy(buf, edid + block * EDID_LENGTH, EDID_LENGTH);
 	return 0;
 }
 
 static int trigger2_connector_get_modes(struct drm_connector *connector)
 {
-	struct trigger2_edid_read ctx = {
-		.trigger2 = to_trigger2(connector->dev),
-	};
+	struct trigger2_device *trigger2 = to_trigger2(connector->dev);
 	const struct drm_edid *edid;
 	int count;
 
-	edid = drm_edid_read_custom(connector, trigger2_read_edid, &ctx);
+	edid = drm_edid_read_custom(connector, trigger2_read_edid, trigger2);
 	drm_edid_connector_update(connector, edid);
 	count = drm_edid_connector_add_modes(connector);
 	if (!count)
@@ -97,17 +74,16 @@ static enum drm_connector_status
 trigger2_detect(struct drm_connector *connector, bool force)
 {
 	struct trigger2_device *trigger2 = to_trigger2(connector->dev);
-	u8 reply[TRIGGER2_REPLY_BUF_LEN];
 	int ret;
 
-	ret = trigger2_fetch_edid(trigger2, reply);
+	ret = trigger2_fetch_edid(trigger2, trigger2->edid);
 	if (ret)
 		return connector_status_unknown;
-	if (drm_edid_header_is_valid(reply) == 8 &&
-	    trigger2_edid_checksum_ok(reply))
+	if (drm_edid_header_is_valid(trigger2->edid) == 8 &&
+	    trigger2_edid_checksum_ok(trigger2->edid))
 		return connector_status_connected;
 	/* This adapter returns an all-ff base block while DDC/HPD is absent. */
-	if (!memchr_inv(reply, 0xff, EDID_LENGTH))
+	if (!memchr_inv(trigger2->edid, 0xff, EDID_LENGTH))
 		return connector_status_disconnected;
 	return connector_status_unknown;
 }
