@@ -6,6 +6,7 @@
 #include <linux/atomic.h>
 #include <linux/bitops.h>
 #include <linux/completion.h>
+#include <linux/container_of.h>
 #include <linux/minmax.h>
 #include <linux/mutex.h>
 #include <linux/types.h>
@@ -63,6 +64,7 @@ struct trigger2_device {
 	struct drm_device drm;
 	struct usb_interface *intf;
 	unsigned int bulk_pipe;
+	/* Serializes command buffers and all EP03/IN81 request/reply pairs. */
 	struct mutex cmd_lock;
 	u8 *cmd_buf;
 	u8 *reply_buf;
@@ -127,7 +129,7 @@ void trigger2_free_bulk_buffer(struct trigger2_transfer_buf *buf);
 int trigger2_transfer_init(struct trigger2_device *trigger2);
 void trigger2_stop_io(struct trigger2_device *trigger2);
 int trigger2_transfer_mode_init(struct trigger2_device *trigger2,
-			       const struct drm_display_mode *mode);
+				const struct drm_display_mode *mode);
 int trigger2_transfer_blank_frame(struct trigger2_device *trigger2,
 				  u16 width, u16 height);
 void trigger2_plane_atomic_update(struct drm_plane *plane,

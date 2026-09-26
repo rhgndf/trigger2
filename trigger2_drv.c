@@ -1,14 +1,24 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+#include <linux/device.h>
 #include <linux/err.h>
-#include <linux/slab.h>
+#include <linux/errno.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/pm.h>
+#include <linux/slab.h>
+#include <linux/types.h>
+#include <linux/usb.h>
+#include <linux/workqueue.h>
 
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fbdev_shmem.h>
+#include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>
+#include <drm/drm_mode_config.h>
 #include <drm/drm_modeset_helper.h>
 #include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>

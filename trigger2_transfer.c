@@ -1,21 +1,40 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+#include <asm/byteorder.h>
+
+#include <linux/atomic.h>
+#include <linux/compiler.h>
+#include <linux/completion.h>
+#include <linux/container_of.h>
 #include <linux/device.h>
+#include <linux/dma-direction.h>
+#include <linux/errno.h>
+#include <linux/iosys-map.h>
 #include <linux/jiffies.h>
 #include <linux/limits.h>
+#include <linux/math.h>
+#include <linux/minmax.h>
 #include <linux/overflow.h>
 #include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/types.h>
 #include <linux/unaligned.h>
+#include <linux/usb.h>
 #include <linux/vmalloc.h>
+#include <linux/workqueue.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_cache.h>
+#include <drm/drm_crtc.h>
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
+#include <drm/drm_modes.h>
+#include <drm/drm_plane.h>
 #include <drm/drm_print.h>
+#include <drm/drm_rect.h>
 
 #include "trigger2.h"
 #include "trigger2_registers.h"
@@ -73,8 +92,8 @@ static int trigger2_send_bulk(struct trigger2_device *trigger2,
 	/* NULL data produces the zero-filled mode bitmap without staging it. */
 	while (offset < len) {
 		if (submitted - completed == TRIGGER2_BULK_URBS) {
-			ret = trigger2_wait_chunk(&trigger2->chunks[
-						completed % TRIGGER2_BULK_URBS]);
+			chunk = &trigger2->chunks[completed % TRIGGER2_BULK_URBS];
+			ret = trigger2_wait_chunk(chunk);
 			if (ret)
 				goto cancel;
 			completed++;
@@ -96,8 +115,8 @@ static int trigger2_send_bulk(struct trigger2_device *trigger2,
 	}
 
 	while (completed < submitted) {
-		ret = trigger2_wait_chunk(&trigger2->chunks[
-					completed % TRIGGER2_BULK_URBS]);
+		chunk = &trigger2->chunks[completed % TRIGGER2_BULK_URBS];
+		ret = trigger2_wait_chunk(chunk);
 		if (ret)
 			goto cancel;
 		completed++;
@@ -180,7 +199,8 @@ int trigger2_transfer_mode_init(struct trigger2_device *trigger2,
 	put_unaligned_le16(height / 4, setup + 7);
 	put_unaligned_le16(width, setup + 9);
 	put_unaligned_le16(height, setup + 11);
-	setup[14] = setup[16] = 0x10;
+	setup[14] = 0x10;
+	setup[16] = 0x10;
 	put_unaligned_le32(32 * pixels + 4, setup + 17);
 
 	ret = trigger2_send_bulk(trigger2, setup, 21, NULL, bitmap_len);
@@ -200,7 +220,8 @@ static void trigger2_frame_header(u8 *header, u32 addr, u16 width, u16 height,
 	put_unaligned_le16(height, header + 12);
 	put_unaligned_le16(width, header + 14);
 	put_unaligned_le16(height, header + 16);
-	header[19] = header[21] = 0x40;
+	header[19] = 0x40;
+	header[21] = 0x40;
 	put_unaligned_le32(frame_end, header + 23);
 	put_unaligned_le24(raw_len, header + 27);
 	put_unaligned_le24(encoded_len, header + 30);
@@ -425,7 +446,8 @@ void trigger2_plane_atomic_update(struct drm_plane *plane,
 		current_rect.x1 = round_down(current_rect.x1, 64);
 		current_rect.x2 = min_t(int, round_up(current_rect.x2, 64),
 					mode->hdisplay);
-		/* Preserve partial-frame width granularity when clipping the right
+		/*
+		 * Preserve partial-frame width granularity when clipping the right
 		 * edge. A full-width frame can instead use padded rows.
 		 */
 		current_rect.x1 = max(0, current_rect.x2 -

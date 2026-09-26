@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
+#include <linux/array_size.h>
+#include <linux/errno.h>
+#include <linux/mutex.h>
 #include <linux/string.h>
+#include <linux/types.h>
 
 #include <drm/drm_atomic_state_helper.h>
 #include <drm/drm_connector.h>
@@ -23,7 +27,7 @@ static bool trigger2_edid_checksum_ok(const u8 *block)
 }
 
 static int trigger2_fetch_edid(struct trigger2_device *trigger2,
-				u8 reply[TRIGGER2_EDID_LEN])
+			       u8 reply[TRIGGER2_EDID_LEN])
 {
 	int idx, ret;
 

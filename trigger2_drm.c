@@ -1,26 +1,38 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/array_size.h>
+#include <linux/compiler.h>
+#include <linux/container_of.h>
 #include <linux/err.h>
+#include <linux/errno.h>
+#include <linux/limits.h>
 #include <linux/math.h>
-#include <linux/math64.h>
 #include <linux/minmax.h>
+#include <linux/mutex.h>
 #include <linux/overflow.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
-#include <linux/version.h>
+#include <linux/types.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_atomic_state_helper.h>
+#include <drm/drm_connector.h>
+#include <drm/drm_crtc.h>
 #include <drm/drm_crtc_helper.h>
+#include <drm/drm_damage_helper.h>
+#include <drm/drm_device.h>
 #include <drm/drm_drv.h>
+#include <drm/drm_encoder.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_managed.h>
+#include <drm/drm_mode_config.h>
+#include <drm/drm_modes.h>
 #include <drm/drm_modeset_helper.h>
 #include <drm/drm_modeset_helper_vtables.h>
+#include <drm/drm_plane.h>
 #include <drm/drm_print.h>
 
 #include "trigger2.h"
@@ -152,7 +164,6 @@ static void trigger2_crtc_destroy_state(struct drm_crtc *crtc,
 	kfree(tstate);
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 3, 0)
 static struct drm_crtc_state *
 trigger2_crtc_create_state(struct drm_crtc *crtc)
 {
@@ -164,19 +175,6 @@ trigger2_crtc_create_state(struct drm_crtc *crtc)
 	__drm_atomic_helper_crtc_state_init(&tstate->base, crtc);
 	return &tstate->base;
 }
-#else
-static void trigger2_crtc_reset(struct drm_crtc *crtc)
-{
-	struct trigger2_crtc_state *tstate;
-
-	if (crtc->state)
-		trigger2_crtc_destroy_state(crtc, crtc->state);
-
-	tstate = kzalloc_obj(*tstate);
-	if (tstate)
-		__drm_atomic_helper_crtc_reset(crtc, &tstate->base);
-}
-#endif
 
 static struct drm_crtc_state *
 trigger2_crtc_duplicate_state(struct drm_crtc *crtc)
@@ -276,7 +274,7 @@ static int trigger2_prime_channels_locked(struct trigger2_device *trigger2,
 	const u8 release[] = { TRIGGER2_CMD_AUX_PAIRS, 2, 0x36, 0x04 };
 	const u8 activate[] = {
 		TRIGGER2_CMD_FRAME_BANK, TRIGGER2_REG_CHANNEL_STROBE >> 8,
-		1, (u8)TRIGGER2_REG_CHANNEL_STROBE, 0x10,
+		1, TRIGGER2_REG_CHANNEL_STROBE & 0xff, 0x10,
 	};
 	unsigned int i;
 	int ret;
@@ -570,7 +568,8 @@ static int trigger2_program_mode_locked(struct trigger2_device *trigger2,
 	if (ret)
 		return ret;
 	ret = trigger2_transfer_blank_frame(trigger2, mode->hdisplay,
-			trigger2_padded_height(mode->hdisplay, mode->vdisplay));
+					    trigger2_padded_height(mode->hdisplay,
+								   mode->vdisplay));
 	if (ret)
 		return ret;
 	ret = trigger2_transfer_blank_frame(trigger2, 64, 16);
@@ -578,7 +577,7 @@ static int trigger2_program_mode_locked(struct trigger2_device *trigger2,
 		return ret;
 	if (!trigger2->mode_programmed) {
 		ret = trigger2_prime_channels_locked(trigger2, phase[0],
-						      phase[1]);
+						     phase[1]);
 		if (ret)
 			return ret;
 	}
@@ -691,11 +690,7 @@ static const struct drm_crtc_helper_funcs trigger2_crtc_helper_funcs = {
 };
 
 static const struct drm_crtc_funcs trigger2_crtc_funcs = {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 3, 0)
 	.atomic_create_state = trigger2_crtc_create_state,
-#else
-	.reset = trigger2_crtc_reset,
-#endif
 	.destroy = drm_crtc_cleanup,
 	.set_config = drm_atomic_helper_set_config,
 	.page_flip = drm_atomic_helper_page_flip,
