@@ -43,14 +43,14 @@ static int trigger2_read_edid(void *data, u8 *buf, unsigned int block,
 	struct trigger2_device *trigger2 = data;
 	const u8 *edid = trigger2->edid;
 
-	if (len != EDID_LENGTH ||
-	    block >= ARRAY_SIZE(trigger2->edid) / EDID_LENGTH)
+	if (len != EDID_LENGTH)
 		return -EINVAL;
 
-	if (block > edid[126])
-		return -EOVERFLOW;
-
-	memcpy(buf, edid + block * EDID_LENGTH, EDID_LENGTH);
+	/* All-ff fails checksum validation, so DRM drops only this extension. */
+	if (block >= ARRAY_SIZE(trigger2->edid) / EDID_LENGTH)
+		memset(buf, 0xff, len);
+	else
+		memcpy(buf, edid + block * EDID_LENGTH, len);
 	return 0;
 }
 
@@ -59,6 +59,9 @@ static int trigger2_connector_get_modes(struct drm_connector *connector)
 	struct trigger2_device *trigger2 = to_trigger2(connector->dev);
 	const struct drm_edid *edid;
 	int count;
+
+	if (trigger2_fetch_edid(trigger2, trigger2->edid))
+		memset(trigger2->edid, 0, sizeof(trigger2->edid));
 
 	edid = drm_edid_read_custom(connector, trigger2_read_edid, trigger2);
 	drm_edid_connector_update(connector, edid);
