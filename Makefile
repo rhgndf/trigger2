@@ -1,6 +1,6 @@
 trigger2-y := \
 	trigger2_connector.o \
-	trigger2_crtc.o \
+	trigger2_drm.o \
 	trigger2_drv.o \
 	trigger2_registers.o \
 	trigger2_transfer.o
